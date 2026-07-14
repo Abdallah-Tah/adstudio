@@ -1,0 +1,32 @@
+[project]
+name = "ad-studio-backend"
+version = "0.1.0"
+description = "AI Ad Studio v3 backend — photos to platform-ready TikTok ad with human review gates"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.139.0",
+    "pydantic==2.13.4",
+    "sqlalchemy==2.0.51",
+    "celery==5.6.3",
+    "redis==8.0.1",
+    "boto3==1.43.47",
+    "psycopg[binary]==3.3.4",
+    "uvicorn==0.51.0",
+    "python-multipart==0.0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
