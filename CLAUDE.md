@@ -33,8 +33,8 @@ Pipeline: product photos → platform-ready TikTok ad (9:16 MP4), with human rev
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Repo scaffold, compose, /health, schema round-trip test | **At STOP GATE 0 — awaiting "Go"** |
-| 1 (M0) | Storyboard engine (stages 1–4, API, CLI, styles, cost metering) | Not started |
+| 0 | Repo scaffold, compose, /health, schema round-trip test | ✅ Done — Gate 0 passed 2026-07-14 |
+| 1 (M0) | Storyboard engine (stages 1–4, API, CLI, styles, cost metering) | **At STOP GATE 1 — awaiting "Go"** (live CLI runs pending Abdallah's photos + OPENAI_API_KEY in backend/.env) |
 | 2 (M1) | Image loop + editor seed | Not started |
 | 3 (M2) | Video, QC, audio, render | Not started |
 | 4 (M3) | Beta instrumentation | Not started |

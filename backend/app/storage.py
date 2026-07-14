@@ -15,3 +15,24 @@ def make_s3_client():
 
 def bucket_name() -> str:
     return os.environ.get("S3_BUCKET", "ad-studio")
+
+
+class Storage:
+    """Thin upload/download wrapper; injectable so tests can fake it."""
+
+    def __init__(self, client=None, bucket: str | None = None):
+        self.client = client or make_s3_client()
+        self.bucket = bucket or bucket_name()
+
+    def ensure_bucket(self) -> None:
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+        except Exception:
+            self.client.create_bucket(Bucket=self.bucket)
+
+    def put_bytes(self, data: bytes, key: str, content_type: str) -> str:
+        """Upload and return the canonical s3:// URI."""
+        self.client.put_object(
+            Bucket=self.bucket, Key=key, Body=data, ContentType=content_type
+        )
+        return f"s3://{self.bucket}/{key}"

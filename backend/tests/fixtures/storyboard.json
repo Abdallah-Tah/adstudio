@@ -1,0 +1,9 @@
+{
+  "scenes": [
+    {"duration_s": 3.5, "camera": "handheld eye-level, slow drift toward the mug", "lighting": "golden-hour window light", "action": "steaming mug pushed away with a grimace, pour-over slides into frame", "vo_line": "Your morning coffee should not taste bitter.", "caption": "bitter coffee again?", "caption_style": "bounce", "transition_out": "cut"},
+    {"duration_s": 4.5, "camera": "shallow depth of field, top-down tilt", "lighting": "gentle lens bloom over the brew bed", "action": "water spirals over grounds, even bloom rising", "vo_line": "This ceramic pour-over gives you an even extraction every single time.", "caption": "even extraction", "caption_style": "highlight", "transition_out": "cut"},
+    {"duration_s": 3.0, "camera": "calm handheld, side profile at counter height", "lighting": "warm neutrals, soft morning light", "action": "single continuous pour, clean counter, no drips", "vo_line": "One pour, no mess, no guesswork.", "caption": "one pour. done.", "caption_style": "bounce", "transition_out": "fade"},
+    {"duration_s": 4.5, "camera": "macro glide along the cup rim", "lighting": "honey-toned backlight through the coffee", "action": "smooth coffee stream fills a ceramic cup to the last drop", "vo_line": "Just smooth, clean coffee from the first sip to the last drop.", "caption": null, "caption_style": "plain", "transition_out": "cut"},
+    {"duration_s": 4.5, "camera": "eye-level, subject lifts cup toward lens", "lighting": "bright natural key, gentle falloff", "action": "satisfied first sip, product and offer card in frame", "vo_line": "Launch week only: twenty percent off. Shop now before it is gone.", "caption": "20% OFF · launch week", "caption_style": "bounce", "transition_out": "cut"}
+  ]
+}
