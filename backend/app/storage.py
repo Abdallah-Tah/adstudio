@@ -36,3 +36,8 @@ class Storage:
             Bucket=self.bucket, Key=key, Body=data, ContentType=content_type
         )
         return f"s3://{self.bucket}/{key}"
+
+    def get_bytes(self, uri: str) -> bytes:
+        """Download by canonical s3://bucket/key URI."""
+        bucket, key = uri.removeprefix("s3://").split("/", 1)
+        return self.client.get_object(Bucket=bucket, Key=key)["Body"].read()

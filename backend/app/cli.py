@@ -57,6 +57,56 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_contact_sheet(args: argparse.Namespace) -> int:
+    """Grid of each scene's selected (or latest succeeded) image, for the
+    Gate 2 identity-consistency review."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from app.schema import Project
+
+    engine = db.make_engine()
+    session = db.make_session_factory(engine)()
+    storage = Storage()
+    try:
+        row = session.get(db.ProjectRow, args.project_id)
+        if row is None:
+            print(f"project {args.project_id} not found", file=sys.stderr)
+            return 1
+        project = Project.model_validate(row.data)
+    finally:
+        session.close()
+
+    thumb_w, thumb_h, pad = 270, 480, 12
+    cols = min(5, len(project.scenes))
+    rows = -(-len(project.scenes) // cols)
+    sheet = Image.new("RGB", (cols * (thumb_w + pad) + pad,
+                              rows * (thumb_h + pad + 24) + pad), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, scene in enumerate(project.scenes):
+        gen = next((g for g in scene.generations
+                    if g.generation_id == scene.selected_image), None)
+        if gen is None:
+            gen = next((g for g in reversed(scene.generations)
+                        if g.status == "succeeded"), None)
+        x = pad + (i % cols) * (thumb_w + pad)
+        y = pad + (i // cols) * (thumb_h + pad + 24)
+        if gen and gen.asset:
+            img = Image.open(io.BytesIO(storage.get_bytes(gen.asset.uri)))
+            img.thumbnail((thumb_w, thumb_h))
+            sheet.paste(img, (x, y))
+        else:
+            draw.rectangle([x, y, x + thumb_w, y + thumb_h], outline="grey")
+            draw.text((x + 8, y + 8), "no image", fill="grey")
+        draw.text((x, y + thumb_h + 6),
+                  f"scene {scene.order} · {scene.duration_s}s", fill="black")
+    out = Path(args.out or f"contact_sheet_{args.project_id}.png")
+    sheet.save(out)
+    print(f"wrote {out}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -72,6 +122,12 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--duration", type=float, help="target duration seconds (10-60)")
     create.add_argument("--out", default="project.json")
     create.set_defaults(func=cmd_create)
+
+    sheet = sub.add_parser("contact-sheet",
+                           help="grid of generated images per scene (Gate 2 review)")
+    sheet.add_argument("project_id")
+    sheet.add_argument("--out")
+    sheet.set_defaults(func=cmd_contact_sheet)
 
     args = parser.parse_args(argv)
     return args.func(args)

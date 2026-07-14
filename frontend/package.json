@@ -1,0 +1,22 @@
+{
+  "name": "ad-studio-editor",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.2",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.7",
+    "tailwindcss": "4.3.2",
+    "typescript": "5.9.3"
+  }
+}

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app import segmentation
 from app.db import ProjectRow
 from app.schema import AssetRef, CostLedger, Project
 from app.snapshots import snapshot_project, snapshot_state
@@ -35,20 +36,31 @@ def create_project(
     """Upload photos, run stages 1-4, snapshot after each, persist the Project."""
     project_id = f"prj_{uuid.uuid4().hex[:12]}"
 
-    # Upload originals as reference assets.
+    # Upload originals + rembg cutouts as reference assets.
     storage.ensure_bucket()
     refs: list[AssetRef] = []
     photo_payloads: list[tuple[bytes, str]] = []
+    notes: list[str] = []
     for filename, raw in photos:
         mime = guess_mime(filename)
         asset_id = f"ast_{uuid.uuid4().hex[:12]}"
         uri = storage.put_bytes(raw, f"{project_id}/uploads/{asset_id}", mime)
         refs.append(AssetRef(asset_id=asset_id, kind="reference", uri=uri, created_at=_now()))
         photo_payloads.append((raw, mime))
+        cutout, note = segmentation.segment(raw)
+        if cutout is not None:
+            cut_id = f"ast_{uuid.uuid4().hex[:12]}"
+            cut_uri = storage.put_bytes(
+                cutout, f"{project_id}/uploads/{cut_id}.png", "image/png")
+            refs.append(AssetRef(asset_id=cut_id, kind="reference", uri=cut_uri,
+                                 reference_assets=[asset_id], created_at=_now()))
+        else:
+            notes.append(f"{filename}: {note}")
 
     cost = CostLedger()
     state: dict = {"project_id": project_id, "description": description,
-                   "user_inputs": user.model_dump(exclude_none=True)}
+                   "user_inputs": user.model_dump(exclude_none=True),
+                   "notes": notes}
 
     # Stage 1 — analysis
     profile, c = analysis.run(photo_payloads, description, refs)

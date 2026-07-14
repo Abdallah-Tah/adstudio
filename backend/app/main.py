@@ -3,16 +3,19 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app import db
+from app.compiler.gpt_image import compile_image_prompt
 from app.pipeline import create_project
 from app.schema import Project
 from app.snapshots import snapshot_project
 from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
 from app.storage import Storage
+from app.workers import images as image_worker
 
 _session_factory = None
 
@@ -39,9 +42,32 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Ad Studio", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # editor v0, single-user localhost
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SessionDep = Annotated[Session, Depends(get_session)]
 StorageDep = Annotated[Storage, Depends(get_storage)]
+
+
+def enriched(project: Project) -> dict:
+    """Project JSON with computed (not stored) staleness on image generations:
+    a generation is stale when its prompt_hash no longer matches the hash of
+    the prompt compiled from the scene's current intent."""
+    doc = project.model_dump(mode="json")
+    for scene, scene_doc in zip(project.scenes, doc["scenes"]):
+        current = compile_image_prompt(
+            scene, project.strategy.style_id, project.product
+        ).prompt_hash
+        for gen_doc in scene_doc["generations"]:
+            gen_doc["stale"] = (
+                gen_doc["kind"] == "image" and gen_doc["prompt_hash"] != current
+            )
+    doc["cost"]["total"] = project.cost.total
+    return doc
 
 
 @app.get("/health")
@@ -66,7 +92,7 @@ async def post_project(
     tone: Annotated[Optional[str], Form()] = None,
     style: Annotated[Optional[str], Form()] = None,
     target_duration_s: Annotated[Optional[float], Form()] = None,
-) -> Project:
+) -> dict:
     if not photos:
         raise HTTPException(422, "at least one photo is required")
     user = UserInputs(
@@ -75,7 +101,7 @@ async def post_project(
     )
     payloads = [(p.filename or "photo.jpg", await p.read()) for p in photos]
     try:
-        return create_project(session, storage, payloads, description, user)
+        return enriched(create_project(session, storage, payloads, description, user))
     except (StoryboardValidationError, ValueError) as exc:
         raise HTTPException(422, str(exc))
 
@@ -87,9 +113,20 @@ def _load_project(session: Session, project_id: str) -> tuple[db.ProjectRow, Pro
     return row, Project.model_validate(row.data)
 
 
+@app.get("/projects")
+def list_projects(session: SessionDep) -> list[dict]:
+    rows = session.query(db.ProjectRow).order_by(db.ProjectRow.created_at.desc()).all()
+    return [
+        {"project_id": r.project_id, "name": r.data["product"]["name"],
+         "scenes": len(r.data["scenes"]), "created_at": r.data["created_at"],
+         "cost_cents": sum(r.data["cost"].values())}
+        for r in rows
+    ]
+
+
 @app.get("/projects/{project_id}")
-def get_project(project_id: str, session: SessionDep) -> Project:
-    return _load_project(session, project_id)[1]
+def get_project(project_id: str, session: SessionDep) -> dict:
+    return enriched(_load_project(session, project_id)[1])
 
 
 @app.get("/projects/{project_id}/versions")
@@ -130,7 +167,7 @@ class ScenePatch(BaseModel):
 @app.post("/projects/{project_id}/scenes/{scene_id}")
 def patch_scene(
     project_id: str, scene_id: str, patch: ScenePatch, session: SessionDep
-) -> Project:
+) -> dict:
     row, project = _load_project(session, project_id)
     scene = next((s for s in project.scenes if s.scene_id == scene_id), None)
     if scene is None:
@@ -148,4 +185,60 @@ def patch_scene(
     snapshot_project(session, project, actor="user",
                      reason=f"scene edit {scene_id}: {sorted(updates)}")
     session.commit()
-    return project
+    return enriched(project)
+
+
+@app.post("/projects/{project_id}/scenes/{scene_id}/generate-image")
+def generate_image(project_id: str, scene_id: str, session: SessionDep) -> dict:
+    _, project = _load_project(session, project_id)
+    if not any(s.scene_id == scene_id for s in project.scenes):
+        raise HTTPException(404, f"scene {scene_id} not found")
+    try:
+        generation = image_worker.start_generation(session, project, scene_id)
+    except image_worker.AttemptCapReached as exc:
+        raise HTTPException(409, str(exc))
+    image_worker.generate_scene_image.delay(project_id, generation.generation_id)
+    return {"generation_id": generation.generation_id, "status": generation.status}
+
+
+class SelectImage(BaseModel):
+    generation_id: str
+
+
+@app.post("/projects/{project_id}/scenes/{scene_id}/select-image")
+def select_image(project_id: str, scene_id: str, body: SelectImage,
+                 session: SessionDep) -> dict:
+    row, project = _load_project(session, project_id)
+    scene = next((s for s in project.scenes if s.scene_id == scene_id), None)
+    if scene is None:
+        raise HTTPException(404, f"scene {scene_id} not found")
+    gen = next((g for g in scene.generations
+                if g.generation_id == body.generation_id), None)
+    if gen is None:
+        raise HTTPException(404, f"generation {body.generation_id} not found")
+    if gen.status != "succeeded":
+        raise HTTPException(422, f"generation status is {gen.status!r}, not succeeded")
+    scene.selected_image = gen.generation_id
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"select image {body.generation_id} for {scene_id}")
+    session.commit()
+    return enriched(project)
+
+
+@app.get("/projects/{project_id}/assets/{asset_id}")
+def get_asset(project_id: str, asset_id: str, session: SessionDep,
+              storage: StorageDep):
+    """Stream an asset to the editor (browser can't read s3:// URIs)."""
+    from fastapi.responses import Response as BytesResponse
+
+    _, project = _load_project(session, project_id)
+    assets = list(project.product.reference_images)
+    for scene in project.scenes:
+        assets += [g.asset for g in scene.generations if g.asset]
+    ref = next((a for a in assets if a.asset_id == asset_id), None)
+    if ref is None:
+        raise HTTPException(404, f"asset {asset_id} not found")
+    data = storage.get_bytes(ref.uri)
+    mime = "image/png" if ref.uri.endswith(".png") or ref.kind == "image" else "image/jpeg"
+    return BytesResponse(content=data, media_type=mime)

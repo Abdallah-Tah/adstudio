@@ -61,7 +61,57 @@ class FakeStorage:
         self.objects[key] = data
         return f"s3://{self.bucket}/{key}"
 
+    def get_bytes(self, uri: str) -> bytes:
+        return self.objects[uri.removeprefix(f"s3://{self.bucket}/")]
+
 
 @pytest.fixture
 def fake_storage():
     return FakeStorage()
+
+
+def tiny_png() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGBA", (8, 8), (200, 100, 50, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def client(sqlite_session, fake_storage, monkeypatch):
+    """TestClient wired to sqlite + fake storage; rembg stubbed out."""
+    from fastapi.testclient import TestClient
+
+    from app import pipeline
+    from app.main import app, get_session, get_storage
+
+    monkeypatch.setattr(db, "init_db", lambda *a, **k: None)  # lifespan no-op
+    monkeypatch.setattr(pipeline.segmentation, "segment",
+                        lambda raw: (tiny_png(), None))
+    app.dependency_overrides[get_session] = lambda: sqlite_session
+    app.dependency_overrides[get_storage] = lambda: fake_storage
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+def create_test_project(client) -> dict:
+    """POST /projects with the recorded stage fixtures mocked in (respx must be active)."""
+    import respx
+    from httpx import Response
+
+    respx.post("https://api.openai.com/v1/chat/completions").mock(side_effect=[
+        Response(200, json=completion_payload(load_fixture(n)))
+        for n in ("analysis", "brief", "strategy", "storyboard")
+    ])
+    resp = client.post(
+        "/projects",
+        files=[("photos", ("cup.png", tiny_png(), "image/png"))],
+        data={"description": "A ceramic pour-over set.",
+              "offer": "20% off launch week", "cta": "Shop now"},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
