@@ -16,6 +16,7 @@ from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
 from app.storage import Storage
 from app.workers import images as image_worker
+from app.workers import videos as video_worker
 
 _session_factory = None
 
@@ -57,15 +58,25 @@ def enriched(project: Project) -> dict:
     """Project JSON with computed (not stored) staleness on image generations:
     a generation is stale when its prompt_hash no longer matches the hash of
     the prompt compiled from the scene's current intent."""
+    from app.compiler.kling_fal import compile_video_prompt
+
     doc = project.model_dump(mode="json")
     for scene, scene_doc in zip(project.scenes, doc["scenes"]):
-        current = compile_image_prompt(
+        current_img = compile_image_prompt(
             scene, project.strategy.style_id, project.product
         ).prompt_hash
+        current_vid = (
+            compile_video_prompt(scene, project.strategy.style_id).prompt_hash
+            if scene.selected_image else None
+        )
         for gen_doc in scene_doc["generations"]:
-            gen_doc["stale"] = (
-                gen_doc["kind"] == "image" and gen_doc["prompt_hash"] != current
-            )
+            if gen_doc["kind"] == "image":
+                gen_doc["stale"] = gen_doc["prompt_hash"] != current_img
+            else:
+                gen_doc["stale"] = (
+                    current_vid is not None
+                    and gen_doc["prompt_hash"] != current_vid
+                )
     doc["cost"]["total"] = project.cost.total
     return doc
 
@@ -383,6 +394,28 @@ def generate_image(project_id: str, scene_id: str, session: SessionDep) -> dict:
     return {"generation_id": generation.generation_id, "status": generation.status}
 
 
+@app.post("/projects/{project_id}/scenes/{scene_id}/generate-video")
+def generate_video(project_id: str, scene_id: str, session: SessionDep) -> dict:
+    """Stage 6: image-to-video for one scene. Requires a selected image."""
+    _, project = _load_project(session, project_id)
+    if not any(s.scene_id == scene_id for s in project.scenes):
+        raise HTTPException(404, f"scene {scene_id} not found")
+    try:
+        generation = video_worker.start_video_generation(session, project, scene_id)
+    except video_worker.AttemptCapReached as exc:
+        raise HTTPException(409, str(exc))
+    except image_worker.ProviderNotConfigured as exc:
+        raise HTTPException(409, {
+            "error_code": image_worker.ProviderNotConfigured.error_code,
+            "detail": str(exc),
+        })
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    video_worker.generate_scene_video.delay(
+        project_id=project_id, generation_id=generation.generation_id)
+    return {"generation_id": generation.generation_id, "status": generation.status}
+
+
 class SelectImage(BaseModel):
     generation_id: str
 
@@ -408,6 +441,28 @@ def select_image(project_id: str, scene_id: str, body: SelectImage,
     return enriched(project)
 
 
+@app.post("/projects/{project_id}/scenes/{scene_id}/select-video")
+def select_video(project_id: str, scene_id: str, body: SelectImage,
+                 session: SessionDep) -> dict:
+    row, project = _load_project(session, project_id)
+    scene = next((s for s in project.scenes if s.scene_id == scene_id), None)
+    if scene is None:
+        raise HTTPException(404, f"scene {scene_id} not found")
+    gen = next((g for g in scene.generations
+                if g.generation_id == body.generation_id and g.kind == "video"),
+               None)
+    if gen is None:
+        raise HTTPException(404, f"video generation {body.generation_id} not found")
+    if gen.status != "succeeded":
+        raise HTTPException(422, f"generation status is {gen.status!r}, not succeeded")
+    scene.selected_video = gen.generation_id
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"select video {body.generation_id} for {scene_id}")
+    session.commit()
+    return enriched(project)
+
+
 @app.get("/projects/{project_id}/assets/{asset_id}")
 def get_asset(project_id: str, asset_id: str, session: SessionDep,
               storage: StorageDep):
@@ -422,5 +477,10 @@ def get_asset(project_id: str, asset_id: str, session: SessionDep,
     if ref is None:
         raise HTTPException(404, f"asset {asset_id} not found")
     data = storage.get_bytes(ref.uri)
-    mime = "image/png" if ref.uri.endswith(".png") or ref.kind == "image" else "image/jpeg"
+    if ref.kind == "video" or ref.uri.endswith(".mp4"):
+        mime = "video/mp4"
+    elif ref.uri.endswith(".png") or ref.kind == "image":
+        mime = "image/png"
+    else:
+        mime = "image/jpeg"
     return BytesResponse(content=data, media_type=mime)

@@ -17,6 +17,7 @@ dependencies = [
     "rembg==2.0.76",
     "onnxruntime==1.27.0",
     "pillow==12.3.0",
+    "httpx==0.28.1",
 ]
 
 [project.optional-dependencies]
