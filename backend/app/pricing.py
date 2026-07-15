@@ -23,6 +23,11 @@ ANTHROPIC_TOKEN_PRICES: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5": (1.00, 5.00),
 }
 
+# ElevenLabs bills subscription credits (~1 credit/char), not per call.
+# Effective $/1k chars on the Creator tier ($22 / 100k credits) — adjust to
+# the actual subscription so CostLedger.voice tracks reality.
+ELEVENLABS_USD_PER_1K_CHARS = 0.22
+
 # $ per image at 1024x1024 by quality; scaled by pixel count, ceil to cents.
 IMAGE_BASE_RATES: dict[str, float] = {"low": 0.006, "medium": 0.053, "high": 0.211}
 IMAGE_BASE_PIXELS = 1024 * 1024

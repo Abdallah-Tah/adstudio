@@ -107,6 +107,57 @@ def cmd_contact_sheet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_music_add(args: argparse.Namespace) -> int:
+    """Ingest a licensed track + its license evidence into the music library.
+    A track cannot enter the library without license fields (hard rule)."""
+    import subprocess
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.stages import music
+
+    audio = Path(args.file)
+    if not audio.is_file():
+        print(f"{audio} not found", file=sys.stderr)
+        return 1
+    probe = subprocess.run(
+        ["/usr/bin/ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(audio)], capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"ffprobe failed: {probe.stderr}", file=sys.stderr)
+        return 1
+    duration = float(probe.stdout.strip())
+
+    storage = Storage()
+    storage.ensure_bucket()
+    track_id = f"trk_{uuid.uuid4().hex[:12]}"
+    audio_key = f"music-library/{track_id}{audio.suffix.lower()}"
+    storage.put_bytes(audio.read_bytes(), audio_key, "audio/mpeg")
+
+    evidence_asset_id = None
+    if args.evidence:
+        evidence_asset_id = f"ast_{uuid.uuid4().hex[:12]}"
+        ev = Path(args.evidence)
+        storage.put_bytes(ev.read_bytes(),
+                          f"music-library/evidence/{evidence_asset_id}{ev.suffix}",
+                          "application/octet-stream")
+
+    tracks = music.load_library(storage)
+    tracks.append(music.TrackEntry(
+        track_id=track_id, title=args.title or audio.stem,
+        provider=args.provider, license_id=args.license_id,
+        license_type=args.license_type, source_url=args.source_url,
+        acquired_at=datetime.now(timezone.utc).isoformat(),
+        valid_for_commercial_ads=True,
+        evidence_asset_id=evidence_asset_id,
+        duration_s=duration, moods=args.moods or [], audio_key=audio_key,
+    ))
+    music.save_library(storage, tracks)
+    print(f"{track_id}  {duration:.1f}s  provider={args.provider} "
+          f"license={args.license_id}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -128,6 +179,21 @@ def main(argv: list[str] | None = None) -> int:
     sheet.add_argument("project_id")
     sheet.add_argument("--out")
     sheet.set_defaults(func=cmd_contact_sheet)
+
+    madd = sub.add_parser("music-add",
+                          help="ingest a licensed track into the music library")
+    madd.add_argument("file", help="audio file (mp3)")
+    madd.add_argument("--provider", required=True,
+                      help="catalog/storefront the license was purchased from")
+    madd.add_argument("--license-id", required=True, dest="license_id")
+    madd.add_argument("--license-type", default="royalty_free_commercial",
+                      dest="license_type")
+    madd.add_argument("--source-url", dest="source_url")
+    madd.add_argument("--title")
+    madd.add_argument("--moods", nargs="*",
+                      help="e.g. upbeat warm cinematic minimal")
+    madd.add_argument("--evidence", help="receipt/license PDF to store alongside")
+    madd.set_defaults(func=cmd_music_add)
 
     args = parser.parse_args(argv)
     return args.func(args)

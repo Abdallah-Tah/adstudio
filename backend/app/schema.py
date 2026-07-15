@@ -14,7 +14,9 @@ class AssetRef(BaseModel):
 class Generation(BaseModel):
     generation_id: str
     scene_id: str
-    kind: Literal["image", "video"]
+    # "audio" added for the Project.voiceover generation (stage 8) — the only
+    # amendment to the Section A literal; flagged at Gate 3.
+    kind: Literal["image", "video", "audio"]
     provider: str
     model: str
     prompt: str
