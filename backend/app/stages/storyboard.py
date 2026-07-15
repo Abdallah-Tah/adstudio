@@ -1,8 +1,14 @@
-"""Stage 4: strategy → list[Scene] intents. One structured-output call.
+"""Stage 4: strategy → list[Scene] intents. One structured-output call,
+plus at most ONE corrective retry when machine validation fails.
 
 Validators (machine-enforced, storyboard rejected on violation):
 - scene durations sum to target_duration_s ±3s
 - every vo_line is a contiguous slice of Strategy.script
+
+Retry policy (Gate 2 decision): on the first validation failure the model
+gets its original response back with the sanitized validation errors and one
+chance to correct. A second failure raises STORYBOARD_VALIDATION_FAILED —
+never more than one retry. Both calls are metered.
 """
 import re
 import uuid
@@ -32,8 +38,14 @@ class StoryboardDraft(BaseModel):
     scenes: list[SceneIntent] = Field(min_length=3, max_length=12)
 
 
+PROMPT_VERSION = "storyboard_v1"
+
+
 class StoryboardValidationError(ValueError):
-    pass
+    """Raised after the single corrective retry also fails validation."""
+    error_code = "STORYBOARD_VALIDATION_FAILED"
+    cost_cents: int = 0
+    meta: dict = {}
 
 
 def _norm(text: str) -> str:
@@ -65,10 +77,16 @@ def validate_vo_lines(scenes: list[SceneIntent], script: str) -> None:
         cursor = pos + len(line)
 
 
-def run(strategy: Strategy, brief: CreativeBrief) -> tuple[list[Scene], int]:
-    """Returns (scenes, cost_cents)."""
+def _validate(draft: StoryboardDraft, strategy: Strategy, brief: CreativeBrief) -> None:
+    validate_durations(draft.scenes, brief.target_duration_s)
+    validate_vo_lines(draft.scenes, strategy.script)
+
+
+def run(strategy: Strategy, brief: CreativeBrief) -> tuple[list[Scene], int, dict]:
+    """Returns (scenes, cost_cents, meta). meta records the prompt-template
+    version and whether the corrective retry fired (observability)."""
     prompt = load_prompt(
-        "storyboard_v1",
+        PROMPT_VERSION,
         scene_count=str(strategy.scene_count),
         target_duration_s=str(brief.target_duration_s),
         style_id=strategy.style_id,
@@ -78,11 +96,35 @@ def run(strategy: Strategy, brief: CreativeBrief) -> tuple[list[Scene], int]:
         strategy=strategy.model_dump_json(exclude={"script"}, indent=2),
         script=strategy.script,
     )
-    draft, cost = structured_call(StoryboardDraft, [{"role": "user", "content": prompt}])
-    validate_durations(draft.scenes, brief.target_duration_s)
-    validate_vo_lines(draft.scenes, strategy.script)
+    messages = [{"role": "user", "content": prompt}]
+    draft, cost = structured_call(StoryboardDraft, messages)
+    meta = {"prompt_version": PROMPT_VERSION, "llm_calls": 1,
+            "corrective_retry": False}
+    try:
+        _validate(draft, strategy, brief)
+    except StoryboardValidationError as first_error:
+        # One corrective retry: original response + sanitized validation error.
+        corrective = messages + [
+            {"role": "assistant", "content": draft.model_dump_json()},
+            {"role": "user", "content": (
+                "Your storyboard failed machine validation:\n"
+                f"- {first_error}\n"
+                "Return a corrected storyboard that satisfies every rule in the "
+                "original instructions. Keep everything else unchanged."
+            )},
+        ]
+        draft, retry_cost = structured_call(StoryboardDraft, corrective)
+        cost += retry_cost
+        meta.update(llm_calls=2, corrective_retry=True,
+                    first_error=str(first_error))
+        try:
+            _validate(draft, strategy, brief)
+        except StoryboardValidationError as second_error:
+            second_error.cost_cents = cost
+            second_error.meta = meta
+            raise  # STORYBOARD_VALIDATION_FAILED — never retry more than once
     scenes = [
         Scene(scene_id=f"scn_{uuid.uuid4().hex[:8]}", order=i, **intent.model_dump())
         for i, intent in enumerate(draft.scenes)
     ]
-    return scenes, cost
+    return scenes, cost, meta

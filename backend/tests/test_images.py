@@ -73,28 +73,6 @@ def test_alpha_coverage():
     assert alpha_coverage(buf.getvalue()) == 0.5
 
 
-@pytest.fixture
-def eager_worker(sqlite_session, fake_storage, monkeypatch):
-    """Run the Celery task body synchronously against the test session."""
-    def fake_delay(project_id, generation_id):
-        return image_worker.run_generation(
-            sqlite_session, fake_storage, project_id, generation_id)
-    monkeypatch.setattr(image_worker.generate_scene_image, "delay", fake_delay)
-
-
-@pytest.fixture
-def good_provider(monkeypatch):
-    monkeypatch.setattr(openai_images, "generate_image",
-                        lambda *a, **k: (tiny_png(), 11))
-
-
-@pytest.fixture
-def bad_provider(monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("deliberately bad prompt")
-    monkeypatch.setattr(openai_images, "generate_image", boom)
-
-
 @respx.mock
 def test_generate_select_and_staleness(client, eager_worker, good_provider):
     project = create_test_project(client)

@@ -31,12 +31,15 @@ type Scene = {
   generation_attempts: number;
 };
 
+type ProcessingWarning = { code: string; message: string; asset_id: string | null };
+
 type Project = {
   project_id: string;
-  product: { name: string };
+  product: { name: string; processing_warnings: ProcessingWarning[] };
   strategy: { hook: string; style_id: string };
   brief: { target_duration_s: number };
   scenes: Scene[];
+  storyboard_approval: { status: string; approved_at: string | null };
   cost: Record<string, number> & { total: number };
 };
 
@@ -130,6 +133,25 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           <a href="/" className="text-xs text-neutral-400 hover:underline">← projects</a>
           <h1 className="text-sm font-semibold">{project.product.name}</h1>
         </div>
+        <div className="flex items-center gap-2">
+          <Badge tone={project.storyboard_approval.status === "approved" ? "succeeded" : "draft"}>
+            storyboard {project.storyboard_approval.status}
+          </Badge>
+          {project.storyboard_approval.status !== "approved" ? (
+            <Button
+              variant="outline"
+              onClick={() => act(() => postJSON(`/projects/${project.project_id}/storyboard/approve`))}
+            >
+              Approve storyboard
+            </Button>
+          ) : (
+            <Button
+              onClick={() => act(() => postJSON(`/projects/${project.project_id}/generate-images`))}
+            >
+              Generate all scenes
+            </Button>
+          )}
+        </div>
         <div className="flex gap-3 text-xs text-neutral-600">
           {Object.entries(project.cost)
             .filter(([k, v]) => k !== "total" && v > 0)
@@ -139,6 +161,14 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           <span className="font-semibold">total: {(project.cost.total / 100).toFixed(2)}$</span>
         </div>
       </header>
+
+      {project.product.processing_warnings?.length > 0 && (
+        <div className="border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs text-amber-800">
+          {project.product.processing_warnings.map((w, i) => (
+            <p key={i}>⚠ {w.code}: {w.message} (original photo kept as reference — you can continue or replace it)</p>
+          ))}
+        </div>
+      )}
 
       <div className="flex flex-1 overflow-hidden">
         {/* scene rail */}

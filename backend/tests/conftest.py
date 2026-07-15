@@ -81,6 +81,33 @@ def tiny_png() -> bytes:
 
 
 @pytest.fixture
+def eager_worker(sqlite_session, fake_storage, monkeypatch):
+    """Run the Celery task body synchronously against the test session."""
+    from app.workers import images as image_worker
+
+    def fake_delay(project_id, generation_id):
+        return image_worker.run_generation(
+            sqlite_session, fake_storage, project_id, generation_id)
+    monkeypatch.setattr(image_worker.generate_scene_image, "delay", fake_delay)
+
+
+@pytest.fixture
+def good_provider(monkeypatch):
+    from app.providers import openai_images
+    monkeypatch.setattr(openai_images, "generate_image",
+                        lambda *a, **k: (tiny_png(), 11))
+
+
+@pytest.fixture
+def bad_provider(monkeypatch):
+    from app.providers import openai_images
+
+    def boom(*a, **k):
+        raise RuntimeError("deliberately bad prompt")
+    monkeypatch.setattr(openai_images, "generate_image", boom)
+
+
+@pytest.fixture
 def client(sqlite_session, fake_storage, monkeypatch):
     """TestClient wired to sqlite + fake storage; rembg stubbed out."""
     from fastapi.testclient import TestClient

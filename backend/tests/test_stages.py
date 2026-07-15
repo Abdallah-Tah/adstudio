@@ -72,10 +72,52 @@ def test_stage4_storyboard():
     mock_llm("storyboard")
     brief = CreativeBrief(**load_fixture("brief"))
     strategy = Strategy(**load_fixture("strategy"))
-    scenes, cost = storyboard.run(strategy, brief)
+    scenes, cost, meta = storyboard.run(strategy, brief)
     assert len(scenes) == 5
     assert [s.order for s in scenes] == [0, 1, 2, 3, 4]
     assert all(s.scene_id.startswith("scn_") for s in scenes)
     total = sum(s.duration_s for s in scenes)
     assert abs(total - brief.target_duration_s) <= 3.0
     assert cost > 0
+    assert meta == {"prompt_version": "storyboard_v1", "llm_calls": 1,
+                    "corrective_retry": False}
+
+
+def bad_storyboard() -> dict:
+    """The recorded storyboard with one vo_line rephrased (fails the
+    contiguous-slice validator)."""
+    doc = load_fixture("storyboard")
+    doc["scenes"][0]["vo_line"] = "This line was rephrased by the model."
+    return doc
+
+
+@respx.mock
+def test_stage4_one_corrective_retry_then_success():
+    mock_llm_payloads = [bad_storyboard(), load_fixture("storyboard")]
+    respx.post(OPENAI_URL).mock(side_effect=[
+        Response(200, json=completion_payload(p)) for p in mock_llm_payloads
+    ])
+    brief = CreativeBrief(**load_fixture("brief"))
+    strategy = Strategy(**load_fixture("strategy"))
+    scenes, cost, meta = storyboard.run(strategy, brief)
+    assert len(scenes) == 5
+    assert meta["corrective_retry"] is True
+    assert meta["llm_calls"] == 2
+    assert "vo_line" in meta["first_error"]
+    assert cost >= 2  # both calls metered
+
+
+@respx.mock
+def test_stage4_second_failure_raises_422_code():
+    respx.post(OPENAI_URL).mock(side_effect=[
+        Response(200, json=completion_payload(bad_storyboard())),
+        Response(200, json=completion_payload(bad_storyboard())),
+    ])
+    brief = CreativeBrief(**load_fixture("brief"))
+    strategy = Strategy(**load_fixture("strategy"))
+    with pytest.raises(storyboard.StoryboardValidationError) as exc_info:
+        storyboard.run(strategy, brief)
+    exc = exc_info.value
+    assert exc.error_code == "STORYBOARD_VALIDATION_FAILED"
+    assert exc.cost_cents >= 2  # both calls recorded even on failure
+    assert exc.meta["llm_calls"] == 2

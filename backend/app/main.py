@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app import db
 from app.compiler.gpt_image import compile_image_prompt
 from app.pipeline import create_project
-from app.schema import Project
+from app.schema import Project, StoryboardApproval
 from app.snapshots import snapshot_project
 from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
@@ -102,7 +102,13 @@ async def post_project(
     payloads = [(p.filename or "photo.jpg", await p.read()) for p in photos]
     try:
         return enriched(create_project(session, storage, payloads, description, user))
-    except (StoryboardValidationError, ValueError) as exc:
+    except StoryboardValidationError as exc:
+        raise HTTPException(422, {
+            "error_code": StoryboardValidationError.error_code,
+            "detail": str(exc),
+            "cost_cents": exc.cost_cents,
+        })
+    except ValueError as exc:
         raise HTTPException(422, str(exc))
 
 
@@ -177,15 +183,72 @@ def patch_scene(
         raise HTTPException(422, "empty patch")
     idx = project.scenes.index(scene)
     project.scenes[idx] = scene.model_copy(update=updates)
+    # editing intent after approval returns the storyboard to draft
+    reverted = project.storyboard_approval.status == "approved"
+    if reverted:
+        project.storyboard_approval = StoryboardApproval()
     try:
         project = Project.model_validate(project.model_dump(mode="json"))
     except Exception as exc:
         raise HTTPException(422, str(exc))
     row.data = project.model_dump(mode="json")
-    snapshot_project(session, project, actor="user",
-                     reason=f"scene edit {scene_id}: {sorted(updates)}")
+    reason = f"scene edit {scene_id}: {sorted(updates)}"
+    if reverted:
+        reason += " (storyboard approval reverted to draft)"
+    snapshot_project(session, project, actor="user", reason=reason)
     session.commit()
     return enriched(project)
+
+
+@app.post("/projects/{project_id}/storyboard/approve")
+def approve_storyboard(project_id: str, session: SessionDep) -> dict:
+    """Explicit storyboard approval — the gate for batch image generation."""
+    from datetime import datetime, timezone
+
+    row, project = _load_project(session, project_id)
+    project.storyboard_approval = StoryboardApproval(
+        status="approved",
+        approved_at=datetime.now(timezone.utc).isoformat(),
+        approved_by="user",
+    )
+    version = snapshot_project(session, project, actor="user",
+                               reason="storyboard approved")
+    project.storyboard_approval.approved_version_id = version.version_id
+    row.data = project.model_dump(mode="json")
+    session.commit()
+    return enriched(project)
+
+
+@app.post("/projects/{project_id}/generate-images")
+def generate_all_images(project_id: str, session: SessionDep) -> dict:
+    """Batch generation for every scene without a selected image.
+    Requires explicit storyboard approval (single-scene generate is the
+    unapproved preview path)."""
+    _, project = _load_project(session, project_id)
+    if project.storyboard_approval.status != "approved":
+        raise HTTPException(409, {
+            "error_code": "STORYBOARD_NOT_APPROVED",
+            "detail": "batch image generation requires explicit storyboard approval",
+        })
+    queued, skipped = [], []
+    for scene in project.scenes:
+        if scene.selected_image:
+            skipped.append({"scene_id": scene.scene_id, "reason": "image selected"})
+            continue
+        try:
+            generation = image_worker.start_generation(session, project, scene.scene_id)
+        except image_worker.AttemptCapReached as exc:
+            skipped.append({"scene_id": scene.scene_id, "reason": str(exc)})
+            continue
+        except image_worker.ProviderNotConfigured as exc:
+            raise HTTPException(409, {
+                "error_code": image_worker.ProviderNotConfigured.error_code,
+                "detail": str(exc),
+            })
+        image_worker.generate_scene_image.delay(project_id, generation.generation_id)
+        queued.append({"scene_id": scene.scene_id,
+                       "generation_id": generation.generation_id})
+    return {"queued": queued, "skipped": skipped}
 
 
 @app.post("/projects/{project_id}/scenes/{scene_id}/generate-image")
@@ -197,6 +260,12 @@ def generate_image(project_id: str, scene_id: str, session: SessionDep) -> dict:
         generation = image_worker.start_generation(session, project, scene_id)
     except image_worker.AttemptCapReached as exc:
         raise HTTPException(409, str(exc))
+    except image_worker.ProviderNotConfigured as exc:
+        # consumes nothing: no attempt, no Generation, no queue entry, no cost
+        raise HTTPException(409, {
+            "error_code": image_worker.ProviderNotConfigured.error_code,
+            "detail": str(exc),
+        })
     image_worker.generate_scene_image.delay(project_id, generation.generation_id)
     return {"generation_id": generation.generation_id, "status": generation.status}
 

@@ -11,14 +11,10 @@ from typing import TypeVar
 from openai import OpenAI
 from pydantic import BaseModel
 
+from app.pricing import TOKEN_PRICES as PRICES
+
 # Pinned model snapshot for stages 1-4 (vision + structured outputs).
 STAGE_MODEL = "gpt-5.4-mini-2026-03-17"
-
-# (input $/1M tokens, output $/1M tokens)
-PRICES: dict[str, tuple[float, float]] = {
-    "gpt-5.4-mini-2026-03-17": (0.75, 4.50),
-    "gpt-5.4-mini": (0.75, 4.50),
-}
 
 T = TypeVar("T", bound=BaseModel)
 

@@ -21,6 +21,10 @@ Pipeline: product photos → platform-ready TikTok ad (9:16 MP4), with human rev
 - Every LLM stage call uses structured outputs validated against the Pydantic models — never free-text parsing.
 - Generations are append-only — never deleted, never mutated after terminal status.
 - `generation_attempts` cap of 3 per kind per scene is absolute.
+- Batch image generation requires explicit storyboard approval (`POST .../storyboard/approve`); intent edits revert approval to draft. Single-scene generation is the unapproved preview path.
+- Generation preflight failures (`PROVIDER_NOT_CONFIGURED`) must consume nothing: no attempt, no record, no queue entry, no cost.
+- Storyboard validation gets exactly ONE corrective LLM retry, then `422 STORYBOARD_VALIDATION_FAILED`. Both calls metered.
+- Provider prices live in `app/pricing.py` (versioned config), never inline in code.
 - If an external API's pricing/params/model names are uncertain, check the provider's current docs — never code from memory.
 
 ## Environment notes (this machine)
@@ -34,7 +38,7 @@ Pipeline: product photos → platform-ready TikTok ad (9:16 MP4), with human rev
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 | Repo scaffold, compose, /health, schema round-trip test | ✅ Done — Gate 0 passed 2026-07-14 |
-| 1 (M0) | Storyboard engine (stages 1–4, API, CLI, styles, cost metering) | **At STOP GATE 1 — awaiting "Go"** (live CLI runs pending Abdallah's photos + OPENAI_API_KEY in backend/.env) |
-| 2 (M1) | Image loop + editor seed | Not started |
-| 3 (M2) | Video, QC, audio, render | Not started |
+| 1 (M0) | Storyboard engine (stages 1–4, API, CLI, styles, cost metering) | ✅ Done — Gate 1 passed 2026-07-14 (live prompt-quality review still owed once photos+key exist) |
+| 2 (M1) | Image loop + editor seed | **Gate 2 conditional hold — hardening done 2026-07-15.** Identity benchmark BLOCKED on product photos (`benchmark/README.md`). Real key wired, API + Celery worker running. |
+| 3 (M2) | Video, QC, audio, render | Decided at Gate 2: Kling v3 Standard via fal.ai (`generate_audio=false`) + licensed stock music catalog. Skeleton: `app/compiler/kling_fal.py`. **No paid video jobs until the 8/10 identity benchmark passes.** |
 | 4 (M3) | Beta instrumentation | Not started |

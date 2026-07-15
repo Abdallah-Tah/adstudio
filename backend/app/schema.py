@@ -7,7 +7,7 @@ class AssetRef(BaseModel):
     kind: Literal["image", "video", "audio", "reference", "render"]
     uri: str
     generated_from: Optional[str] = None      # scene_id
-    reference_assets: list[str] = []          # asset_ids conditioned in
+    reference_assets: list[str] = Field(default_factory=list)  # asset_ids conditioned in
     created_at: str                           # ISO 8601
 
 
@@ -20,12 +20,27 @@ class Generation(BaseModel):
     prompt: str
     prompt_hash: str                          # sha256 of compiled prompt
     seed: Optional[int] = None
-    reference_assets: list[str] = []
+    reference_assets: list[str] = Field(default_factory=list)
     status: Literal["queued", "running", "succeeded",
                     "failed", "qc_rejected"] = "queued"
     qc_notes: Optional[str] = None
     cost_cents: int = 0
     asset: Optional[AssetRef] = None
+    created_at: str
+
+
+class ProcessingWarning(BaseModel):
+    """Structured preprocessing diagnostics (e.g. rembg cutout problems).
+    A warning is not a project failure: the original image stays usable."""
+    code: Literal[
+        "segmentation_failed",
+        "segmentation_low_coverage",
+        "segmentation_high_coverage",
+        "unsupported_image",
+    ]
+    asset_id: Optional[str] = None
+    message: str
+    recoverable: bool = True
     created_at: str
 
 
@@ -38,6 +53,7 @@ class ProductProfile(BaseModel):
     key_benefits: list[str] = Field(max_length=3)
     audience: str
     reference_images: list[AssetRef]
+    processing_warnings: list[ProcessingWarning] = Field(default_factory=list)
 
 
 class CreativeBrief(BaseModel):
@@ -73,7 +89,7 @@ class Scene(BaseModel):
     caption: Optional[str] = None
     caption_style: Literal["bounce", "highlight", "plain"] = "bounce"
     transition_out: Literal["cut", "fade", "whip"] = "cut"
-    generations: list[Generation] = []
+    generations: list[Generation] = Field(default_factory=list)
     selected_image: Optional[str] = None      # generation_id
     selected_video: Optional[str] = None      # generation_id
     generation_attempts: int = 0
@@ -100,6 +116,29 @@ class CostLedger(BaseModel):
         return sum(self.model_dump().values())
 
 
+class StoryboardApproval(BaseModel):
+    """Explicit approval state. Batch image generation requires 'approved';
+    single-scene generation is allowed as a preview while draft. Any scene
+    intent edit after approval returns the storyboard to 'draft'."""
+    status: Literal["draft", "approved", "changes_requested"] = "draft"
+    approved_at: Optional[str] = None
+    approved_by: Optional[str] = None
+    approved_version_id: Optional[str] = None
+
+
+class MusicLicense(BaseModel):
+    """License provenance for the licensed stock catalog track (Phase 3).
+    Never store only the audio file — keep the license evidence."""
+    provider: str
+    track_id: str
+    license_id: str
+    license_type: str
+    source_url: Optional[str] = None
+    acquired_at: str
+    valid_for_commercial_ads: bool
+    evidence_asset_id: Optional[str] = None
+
+
 class Project(BaseModel):
     schema_version: Literal["3.0"] = "3.0"
     project_id: str
@@ -108,10 +147,12 @@ class Project(BaseModel):
     brief: CreativeBrief
     strategy: Strategy
     scenes: list[Scene] = Field(min_length=3, max_length=12)
+    storyboard_approval: StoryboardApproval = Field(default_factory=StoryboardApproval)
     voiceover: Optional[Generation] = None
     music: Optional[AssetRef] = None
+    music_license: Optional[MusicLicense] = None
     final_render: Optional[AssetRef] = None
-    cost: CostLedger = CostLedger()
+    cost: CostLedger = Field(default_factory=CostLedger)
 
     @model_validator(mode="after")
     def duration_matches_brief(self):

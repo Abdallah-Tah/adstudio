@@ -9,11 +9,9 @@ import base64
 import io
 import math
 
+from app.pricing import IMAGE_BASE_PIXELS as BASE_PIXELS
+from app.pricing import IMAGE_BASE_RATES as BASE_RATES
 from app.providers.openai_client import client
-
-# $ per image at 1024x1024, per quality (developers.openai.com pricing, 2026-07).
-BASE_RATES = {"low": 0.006, "medium": 0.053, "high": 0.211}
-BASE_PIXELS = 1024 * 1024
 
 
 def image_cost_cents(size: str, quality: str) -> int:

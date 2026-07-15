@@ -3,11 +3,17 @@
 The Generation ledger is append-only: a new Generation row/entry per attempt,
 never mutated after reaching a terminal status.
 """
+import os
 import uuid
 from datetime import datetime, timezone
 
 from app import db
-from app.compiler.gpt_image import compile_image_prompt
+from app.compiler.gpt_image import (
+    IMAGE_QUALITY,
+    IMAGE_SIZE,
+    compile_image_prompt,
+)
+from app.pricing import IMAGE_BASE_RATES
 from app.providers import openai_images
 from app.schema import AssetRef, Generation, Project
 from app.snapshots import snapshot_project
@@ -25,17 +31,41 @@ class AttemptCapReached(Exception):
     pass
 
 
+class ProviderNotConfigured(Exception):
+    """Runtime preflight failure. Must consume NOTHING: no attempt, no
+    Generation record, no queue entry, no cost."""
+    error_code = "PROVIDER_NOT_CONFIGURED"
+
+
+def preflight(project: Project, scene) -> int:
+    """Runtime checks before anything is created or enqueued.
+    Returns the estimated cost in cents."""
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise ProviderNotConfigured("OPENAI_API_KEY is not configured")
+    if IMAGE_QUALITY not in IMAGE_BASE_RATES:
+        raise ProviderNotConfigured(f"unsupported image quality {IMAGE_QUALITY!r}")
+    ref_ids = {a.asset_id for a in project.product.reference_images}
+    compiled = compile_image_prompt(scene, project.strategy.style_id, project.product)
+    if not compiled.reference_asset_ids or not set(compiled.reference_asset_ids) <= ref_ids:
+        raise ProviderNotConfigured("reference images are not accessible")
+    if scene.generation_attempts >= MAX_ATTEMPTS:
+        raise AttemptCapReached(
+            f"scene {scene.scene_id} already used "
+            f"{scene.generation_attempts}/{MAX_ATTEMPTS} image attempts"
+        )
+    return openai_images.image_cost_cents(IMAGE_SIZE, IMAGE_QUALITY)
+
+
 def start_generation(session, project: Project, scene_id: str) -> Generation:
     """Create the queued Generation + bump the attempt counter (cap-checked).
 
     Called from the API before enqueueing so the cap check and the attempt
-    increment are atomic with the snapshot.
+    increment are atomic with the snapshot. preflight() must pass FIRST —
+    a misconfigured provider consumes nothing.
     """
     scene = next(s for s in project.scenes if s.scene_id == scene_id)
-    if scene.generation_attempts >= MAX_ATTEMPTS:
-        raise AttemptCapReached(
-            f"scene {scene_id} already used {scene.generation_attempts}/{MAX_ATTEMPTS} image attempts"
-        )
+    preflight(project, scene)
     compiled = compile_image_prompt(scene, project.strategy.style_id, project.product)
     generation = Generation(
         generation_id=f"gen_{uuid.uuid4().hex[:12]}",
@@ -84,7 +114,6 @@ def run_generation(session, storage: Storage, project_id: str, generation_id: st
     try:
         by_id = {a.asset_id: a for a in project.product.reference_images}
         refs = [storage.get_bytes(by_id[aid].uri) for aid in gen.reference_assets]
-        from app.compiler.gpt_image import IMAGE_QUALITY, IMAGE_SIZE
         png, cost = openai_images.generate_image(
             gen.prompt, refs, IMAGE_SIZE, IMAGE_QUALITY, gen.model
         )
