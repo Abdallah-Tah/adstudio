@@ -4,7 +4,7 @@ import { use, useCallback, useEffect, useState } from "react";
 import { assetUrl, getJSON, postJSON } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 
 type Generation = {
   generation_id: string;
@@ -47,8 +47,14 @@ const INTENT_FIELDS = [
   ["action", "Action"],
   ["camera", "Camera"],
   ["lighting", "Lighting"],
-  ["vo_line", "VO line"],
+  ["vo_line", "Dialogue / VO"],
   ["caption", "Caption"],
+] as const;
+
+const TABS = [
+  ["scenes", "Scenes"],
+  ["preview", "Preview"],
+  ["intent", "Intent"],
 ] as const;
 
 function sceneStatus(s: Scene): string {
@@ -71,6 +77,7 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [tab, setTab] = useState<(typeof TABS)[number][0]>("preview");
 
   const refresh = useCallback(() => {
     getJSON(`/projects/${id}`).then(setProject).catch((e) => setError(String(e)));
@@ -89,11 +96,12 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
     return () => clearInterval(t);
   }, [project, refresh]);
 
-  if (error) return <main className="p-8 text-red-600">{error}</main>;
-  if (!project) return <main className="p-8 text-neutral-500">Loading…</main>;
+  if (error && !project) return <div className="p-8 text-sm text-red-500">{error}</div>;
+  if (!project) return <div className="p-8 text-sm text-muted">Loading…</div>;
 
   const scene = project.scenes[selected];
   const thumb = thumbGen(scene);
+  const approved = project.storyboard_approval.status === "approved";
 
   async function act(fn: () => Promise<unknown>) {
     setError("");
@@ -126,53 +134,62 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   const sorted = [...project.scenes].sort((a, b) => a.order - b.order);
 
   return (
-    <main className="flex h-screen flex-col">
-      {/* header + cost ledger, always visible */}
-      <header className="flex items-center justify-between border-b border-neutral-200 bg-white px-4 py-2">
-        <div>
-          <a href="/" className="text-xs text-neutral-400 hover:underline">← projects</a>
-          <h1 className="text-sm font-semibold">{project.product.name}</h1>
+    <div className="flex h-full flex-col">
+      {/* project toolbar */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-surface px-4 py-2.5">
+        <div className="min-w-0">
+          <h1 className="truncate text-sm font-semibold">{project.product.name}</h1>
+          <p className="truncate text-xs text-muted">{project.strategy.hook}</p>
         </div>
         <div className="flex items-center gap-2">
-          <Badge tone={project.storyboard_approval.status === "approved" ? "succeeded" : "draft"}>
+          <Badge tone={approved ? "succeeded" : "draft"}>
             storyboard {project.storyboard_approval.status}
           </Badge>
-          {project.storyboard_approval.status !== "approved" ? (
-            <Button
-              variant="outline"
-              onClick={() => act(() => postJSON(`/projects/${project.project_id}/storyboard/approve`))}
-            >
+          {!approved ? (
+            <Button size="sm" variant="outline"
+              onClick={() => act(() => postJSON(`/projects/${project.project_id}/storyboard/approve`))}>
               Approve storyboard
             </Button>
           ) : (
-            <Button
-              onClick={() => act(() => postJSON(`/projects/${project.project_id}/generate-images`))}
-            >
+            <Button size="sm" variant="accent"
+              onClick={() => act(() => postJSON(`/projects/${project.project_id}/generate-images`))}>
               Generate all scenes
             </Button>
           )}
         </div>
-        <div className="flex gap-3 text-xs text-neutral-600">
+        <div className="ml-auto flex gap-3 text-xs text-muted">
           {Object.entries(project.cost)
             .filter(([k, v]) => k !== "total" && v > 0)
-            .map(([k, v]) => (
-              <span key={k}>{k}: {(v / 100).toFixed(2)}$</span>
-            ))}
-          <span className="font-semibold">total: {(project.cost.total / 100).toFixed(2)}$</span>
+            .map(([k, v]) => <span key={k}>{k} ${(v / 100).toFixed(2)}</span>)}
+          <span className="font-semibold text-ink">total ${(project.cost.total / 100).toFixed(2)}</span>
         </div>
-      </header>
+      </div>
 
       {project.product.processing_warnings?.length > 0 && (
-        <div className="border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs text-amber-800">
+        <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-400">
           {project.product.processing_warnings.map((w, i) => (
-            <p key={i}>⚠ {w.code}: {w.message} (original photo kept as reference — you can continue or replace it)</p>
+            <p key={i}>⚠ {w.code}: {w.message} (original photo kept as reference)</p>
           ))}
         </div>
       )}
 
-      <div className="flex flex-1 overflow-hidden">
+      {/* mobile tabs */}
+      <div className="flex border-b border-line bg-surface md:hidden">
+        {TABS.map(([key, label]) => (
+          <button key={key} onClick={() => setTab(key)}
+            className={cn("flex-1 border-b-2 py-2 text-xs font-medium",
+              tab === key ? "border-accent text-ink" : "border-transparent text-muted")}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         {/* scene rail */}
-        <aside className="w-56 space-y-2 overflow-y-auto border-r border-neutral-200 bg-white p-2">
+        <aside className={cn(
+          "w-full space-y-2 overflow-y-auto border-r border-line bg-surface p-2 md:block md:w-56",
+          tab !== "scenes" && "hidden"
+        )}>
           {sorted.map((s, i) => {
             const t = thumbGen(s);
             return (
@@ -182,41 +199,44 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
                 onDragStart={() => setDragFrom(i)}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={() => dragFrom !== null && reorder(dragFrom, i)}
-                onClick={() => { setSelected(project.scenes.indexOf(s)); setDraft({}); }}
-                className={`cursor-pointer rounded-md border p-2 ${
-                  s.scene_id === scene.scene_id ? "border-neutral-900" : "border-neutral-200"
-                }`}
+                onClick={() => { setSelected(project.scenes.indexOf(s)); setDraft({}); setTab("preview"); }}
+                className={cn("cursor-pointer rounded-lg border p-2 transition-colors",
+                  s.scene_id === scene.scene_id ? "border-accent ring-1 ring-accent" : "border-line hover:border-muted")}
               >
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="text-xs font-medium">#{s.order} · {s.duration_s}s</span>
+                  <span className="text-xs font-medium">#{s.order + 1} · {s.duration_s}s</span>
                   <Badge tone={sceneStatus(s)}>{sceneStatus(s)}</Badge>
                 </div>
                 {t?.asset ? (
                   /* eslint-disable-next-line @next/next/no-img-element */
                   <img src={assetUrl(project.project_id, t.asset.asset_id)} alt="" className="aspect-[9/16] w-full rounded object-cover" />
                 ) : (
-                  <div className="flex aspect-[9/16] items-center justify-center rounded bg-neutral-100 text-xs text-neutral-400">
+                  <div className="flex aspect-[9/16] items-center justify-center rounded bg-line/40 text-xs text-muted">
                     no image
                   </div>
                 )}
-                <p className="mt-1 line-clamp-2 text-xs text-neutral-500">{s.action}</p>
+                <p className="mt-1 line-clamp-2 text-xs text-muted">{s.action}</p>
               </div>
             );
           })}
         </aside>
 
         {/* preview pane */}
-        <section className="flex flex-1 flex-col items-center justify-center gap-3 overflow-y-auto p-4">
+        <section className={cn(
+          "flex-1 flex-col items-center justify-center gap-3 overflow-y-auto p-4 md:flex",
+          tab === "preview" ? "flex" : "hidden"
+        )}>
           {thumb?.asset ? (
             /* eslint-disable-next-line @next/next/no-img-element */
-            <img src={assetUrl(project.project_id, thumb.asset.asset_id)} alt="" className="max-h-[70vh] rounded-lg shadow" />
+            <img src={assetUrl(project.project_id, thumb.asset.asset_id)} alt="" className="max-h-[62vh] rounded-xl shadow-lg" />
           ) : (
-            <div className="flex aspect-[9/16] h-[60vh] items-center justify-center rounded-lg bg-neutral-100 text-neutral-400">
+            <div className="flex aspect-[9/16] h-[55vh] items-center justify-center rounded-xl bg-line/30 text-sm text-muted">
               no image yet
             </div>
           )}
           <div className="flex gap-2">
             <Button
+              variant="accent"
               onClick={() => act(() => postJSON(`/projects/${project.project_id}/scenes/${scene.scene_id}/generate-image`))}
               disabled={scene.generation_attempts >= 3}
             >
@@ -232,40 +252,47 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
             )}
           </div>
 
-          {/* generation history / compare + select */}
+          {/* generation history */}
           {scene.generations.length > 0 && (
-            <div className="flex max-w-full gap-2 overflow-x-auto">
-              {scene.generations.map((g) => (
-                <div key={g.generation_id} className="w-24 shrink-0 text-center">
-                  {g.asset ? (
-                    /* eslint-disable-next-line @next/next/no-img-element */
-                    <img
-                      src={assetUrl(project.project_id, g.asset.asset_id)}
-                      alt=""
-                      onClick={() => act(() => postJSON(`/projects/${project.project_id}/scenes/${scene.scene_id}/select-image`, { generation_id: g.generation_id }))}
-                      className={`aspect-[9/16] w-full cursor-pointer rounded object-cover ${
-                        g.generation_id === scene.selected_image ? "ring-2 ring-emerald-500" : ""
-                      }`}
-                    />
-                  ) : (
-                    <div className="flex aspect-[9/16] items-center justify-center rounded bg-neutral-100 text-[10px] text-neutral-400">{g.status}</div>
-                  )}
-                  <div className="mt-0.5 flex justify-center gap-1">
-                    <Badge tone={g.status}>{g.status}</Badge>
-                    {g.stale && <Badge tone="stale">stale</Badge>}
+            <div className="w-full max-w-xl">
+              <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-muted">History</p>
+              <div className="flex max-w-full gap-2 overflow-x-auto pb-1">
+                {scene.generations.map((g, gi) => (
+                  <div key={g.generation_id} className="w-24 shrink-0 text-center">
+                    {g.asset ? (
+                      /* eslint-disable-next-line @next/next/no-img-element */
+                      <img
+                        src={assetUrl(project.project_id, g.asset.asset_id)}
+                        alt=""
+                        onClick={() => act(() => postJSON(`/projects/${project.project_id}/scenes/${scene.scene_id}/select-image`, { generation_id: g.generation_id }))}
+                        className={cn("aspect-[9/16] w-full cursor-pointer rounded-lg object-cover",
+                          g.generation_id === scene.selected_image && "ring-2 ring-emerald-500")}
+                      />
+                    ) : (
+                      <div className="flex aspect-[9/16] items-center justify-center rounded-lg bg-line/40 text-[10px] text-muted">{g.status}</div>
+                    )}
+                    <div className="mt-1 text-[10px] text-muted">Gen {gi + 1}</div>
+                    <div className="flex justify-center gap-1">
+                      <Badge tone={g.status}>{g.status}</Badge>
+                      {g.stale && <Badge tone="stale">stale</Badge>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           )}
+          {error && <p className="text-xs text-red-500">{error}</p>}
         </section>
 
         {/* intent panel */}
-        <aside className="w-80 space-y-3 overflow-y-auto border-l border-neutral-200 bg-white p-4">
-          <h2 className="text-sm font-semibold">Scene #{scene.order} intent</h2>
+        <aside className={cn(
+          "w-full space-y-3 overflow-y-auto border-l border-line bg-surface p-4 md:block md:w-80",
+          tab !== "intent" && "hidden"
+        )}>
+          <h2 className="text-sm font-semibold">Scene #{scene.order + 1} intent</h2>
           {INTENT_FIELDS.map(([field, label]) => (
             <label key={field} className="block text-xs">
-              <span className="mb-1 block font-medium text-neutral-600">{label}</span>
+              <span className="mb-1 block font-medium text-muted">{label}</span>
               <textarea
                 rows={2}
                 value={draft[field] ?? scene[field] ?? ""}
@@ -274,40 +301,41 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
                   const v = draft[field];
                   if (v !== undefined && v !== (scene[field] ?? "")) patchScene({ [field]: v });
                 }}
-                className="w-full rounded-md border border-neutral-300 p-2"
+                className="w-full rounded-lg border border-line bg-bg p-2 focus:border-accent focus:outline-none"
               />
             </label>
           ))}
           <label className="block text-xs">
-            <span className="mb-1 block font-medium text-neutral-600">Duration (s)</span>
+            <span className="mb-1 block font-medium text-muted">Duration (s)</span>
             <input
               type="number" step="0.5" min="0.5" max="8"
               defaultValue={scene.duration_s}
               key={scene.scene_id}
               onBlur={(e) => { const v = parseFloat(e.target.value); if (v !== scene.duration_s) patchScene({ duration_s: v }); }}
-              className="w-full rounded-md border border-neutral-300 p-2"
+              className="w-full rounded-lg border border-line bg-bg p-2 focus:border-accent focus:outline-none"
             />
           </label>
           <div className="grid grid-cols-2 gap-2 text-xs">
             <label>
-              <span className="mb-1 block font-medium text-neutral-600">Caption style</span>
-              <select value={scene.caption_style} onChange={(e) => patchScene({ caption_style: e.target.value })} className="w-full rounded-md border border-neutral-300 p-2">
+              <span className="mb-1 block font-medium text-muted">Caption style</span>
+              <select value={scene.caption_style} onChange={(e) => patchScene({ caption_style: e.target.value })} className="w-full rounded-lg border border-line bg-bg p-2">
                 {["bounce", "highlight", "plain"].map((v) => <option key={v}>{v}</option>)}
               </select>
             </label>
             <label>
-              <span className="mb-1 block font-medium text-neutral-600">Transition</span>
-              <select value={scene.transition_out} onChange={(e) => patchScene({ transition_out: e.target.value })} className="w-full rounded-md border border-neutral-300 p-2">
+              <span className="mb-1 block font-medium text-muted">Transition</span>
+              <select value={scene.transition_out} onChange={(e) => patchScene({ transition_out: e.target.value })} className="w-full rounded-lg border border-line bg-bg p-2">
                 {["cut", "fade", "whip"].map((v) => <option key={v}>{v}</option>)}
               </select>
             </label>
           </div>
-          {error && <p className="text-xs text-red-600">{error}</p>}
-          <p className="text-[10px] text-neutral-400">
-            Edits snapshot automatically; existing generations get a “stale” badge when intent changes.
+          {error && <p className="text-xs text-red-500">{error}</p>}
+          <p className="text-[10px] text-muted">
+            Edits snapshot automatically; existing generations get a “stale” badge and an
+            approved storyboard reverts to draft when intent changes.
           </p>
         </aside>
       </div>
-    </main>
+    </div>
   );
 }

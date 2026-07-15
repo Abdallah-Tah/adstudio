@@ -119,14 +119,100 @@ def _load_project(session: Session, project_id: str) -> tuple[db.ProjectRow, Pro
     return row, Project.model_validate(row.data)
 
 
+def _listing_thumb(scenes: list[dict]) -> str | None:
+    for s in scenes:
+        gens = s.get("generations", [])
+        gen = next((g for g in gens if g["generation_id"] == s.get("selected_image")),
+                   None) or next(
+            (g for g in reversed(gens) if g["status"] == "succeeded"), None)
+        if gen and gen.get("asset"):
+            return gen["asset"]["asset_id"]
+    return None
+
+
+def _listing_status(data: dict) -> str:
+    scenes = data["scenes"]
+    if data.get("final_render"):
+        return "video_ready"
+    if all(s.get("selected_image") for s in scenes):
+        return "images_ready"
+    if any(g["status"] in ("queued", "running")
+           for s in scenes for g in s.get("generations", [])):
+        return "running"
+    if any(s.get("selected_image") for s in scenes):
+        return "image_ready"
+    return "storyboard"
+
+
 @app.get("/projects")
 def list_projects(session: SessionDep) -> list[dict]:
     rows = session.query(db.ProjectRow).order_by(db.ProjectRow.created_at.desc()).all()
+    from sqlalchemy import func
+    latest = dict(
+        session.query(db.ProjectVersionRow.project_id,
+                      func.max(db.ProjectVersionRow.created_at))
+        .group_by(db.ProjectVersionRow.project_id).all()
+    )
     return [
         {"project_id": r.project_id, "name": r.data["product"]["name"],
          "scenes": len(r.data["scenes"]), "created_at": r.data["created_at"],
-         "cost_cents": sum(r.data["cost"].values())}
+         "cost_cents": sum(r.data["cost"].values()),
+         "status": _listing_status(r.data),
+         "thumb_asset_id": _listing_thumb(r.data["scenes"]),
+         "updated_at": str(latest.get(r.project_id, r.data["created_at"]))}
         for r in rows
+    ]
+
+
+@app.get("/activity")
+def activity(session: SessionDep) -> list[dict]:
+    """Most recent project mutations — the dashboard activity feed."""
+    rows = (
+        session.query(db.ProjectVersionRow)
+        .order_by(db.ProjectVersionRow.created_at.desc())
+        .limit(12).all()
+    )
+    names: dict[str, str] = {}
+    for v in rows:
+        if v.project_id not in names:
+            p = session.get(db.ProjectRow, v.project_id)
+            names[v.project_id] = (
+                p.data["product"]["name"] if p else v.project_id)
+    return [
+        {"project_id": v.project_id, "project_name": names[v.project_id],
+         "reason": v.reason, "actor": v.actor, "created_at": str(v.created_at)}
+        for v in rows
+    ]
+
+
+@app.get("/providers")
+def providers() -> list[dict]:
+    """Read-only provider connection status (from backend-only env config)."""
+    import os
+
+    from app.compiler.gpt_image import IMAGE_MODEL
+    from app.compiler.kling_fal import VIDEO_MODEL
+    from app.providers.openai_client import STAGE_MODEL
+
+    def ok(key: str) -> bool:
+        return bool(os.environ.get(key))
+
+    return [
+        {"id": "openai", "name": "OpenAI",
+         "role": "Product analysis, strategy, storyboard + image generation",
+         "models": [STAGE_MODEL, IMAGE_MODEL], "connected": ok("OPENAI_API_KEY")},
+        {"id": "fal", "name": "fal.ai",
+         "role": "Video generation — Kling v3 Standard, audio off (Phase 3)",
+         "models": [VIDEO_MODEL], "connected": ok("FAL_KEY")},
+        {"id": "anthropic", "name": "Anthropic",
+         "role": "Vision QC verdicts on generated clips (Phase 3)",
+         "models": [], "connected": ok("ANTHROPIC_API_KEY")},
+        {"id": "elevenlabs", "name": "ElevenLabs",
+         "role": "Voiceover from the script (Phase 3)",
+         "models": [], "connected": ok("ELEVENLABS_API_KEY")},
+        {"id": "music", "name": "Music library",
+         "role": "Licensed stock catalog with stored license IDs (Phase 3)",
+         "models": [], "connected": ok("MUSIC_LIBRARY_KEY")},
     ]
 
 

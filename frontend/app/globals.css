@@ -1,3 +1,41 @@
 @import "tailwindcss";
 
-body { @apply bg-neutral-50 text-neutral-900; }
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --line: #e7e5e4;
+  --ink: #18181b;
+  --muted: #71717a;
+  --accent: #7c3aed;
+  --accent-ink: #ffffff;
+}
+
+.dark {
+  --bg: #09090b;
+  --surface: #131316;
+  --line: #27272a;
+  --ink: #f4f4f5;
+  --muted: #a1a1aa;
+  --accent: #8b5cf6;
+  --accent-ink: #ffffff;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+}
+
+body {
+  @apply bg-bg text-ink;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
