@@ -216,6 +216,33 @@ def providers() -> list[dict]:
     ]
 
 
+class ProviderKeyBody(BaseModel):
+    api_key: str = Field(min_length=8, max_length=512)
+
+
+@app.post("/providers/{provider_id}/key")
+def set_provider_key(provider_id: str, body: ProviderKeyBody) -> dict:
+    """Store a provider API key (write-only — the key is never returned)."""
+    from app import settings_store
+
+    if provider_id not in settings_store.PROVIDER_KEYS:
+        raise HTTPException(404, f"unknown provider {provider_id}")
+    settings_store.set_key(provider_id, body.api_key.strip())
+    return {"id": provider_id, "connected": True,
+            "note": "applied to the API immediately; restart the worker to "
+                    "pick it up there"}
+
+
+@app.delete("/providers/{provider_id}/key")
+def clear_provider_key(provider_id: str) -> dict:
+    from app import settings_store
+
+    if provider_id not in settings_store.PROVIDER_KEYS:
+        raise HTTPException(404, f"unknown provider {provider_id}")
+    settings_store.clear_key(provider_id)
+    return {"id": provider_id, "connected": False}
+
+
 @app.get("/projects/{project_id}")
 def get_project(project_id: str, session: SessionDep) -> dict:
     return enriched(_load_project(session, project_id)[1])

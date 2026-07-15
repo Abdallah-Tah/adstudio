@@ -10,9 +10,10 @@ const NAV = [
   { href: "/", label: "Dashboard", icon: "▦" },
   { href: "/create", label: "Create Ad", icon: "✦" },
   { href: "/providers", label: "Providers", icon: "⚡" },
+  { href: "/settings", label: "Settings", icon: "⚙" },
 ] as const;
 
-const SOON = ["Brand Kits", "Assets", "Templates", "Analytics", "Settings"];
+const SOON = ["Brand Kits", "Assets", "Templates", "Analytics"];
 
 function useTheme() {
   const [dark, setDark] = useState(false);
