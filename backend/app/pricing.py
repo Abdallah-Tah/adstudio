@@ -7,6 +7,7 @@ provider's own docs on PRICING_VERSION date (hard rule: never from memory).
 Sources:
 - developers.openai.com/api/docs/pricing            (tokens + images)
 - fal.ai/models/fal-ai/kling-video/v3/standard/image-to-video  (video, Phase 3)
+- platform.claude.com/docs/en/about-claude/pricing  (QC vision verdicts, Phase 3)
 """
 
 PRICING_VERSION = "2026-07-15"
@@ -15,6 +16,11 @@ PRICING_VERSION = "2026-07-15"
 TOKEN_PRICES: dict[str, tuple[float, float]] = {
     "gpt-5.4-mini-2026-03-17": (0.75, 4.50),
     "gpt-5.4-mini": (0.75, 4.50),
+}
+
+# Anthropic — stage 7 QC verdicts (input $/1M, output $/1M)
+ANTHROPIC_TOKEN_PRICES: dict[str, tuple[float, float]] = {
+    "claude-haiku-4-5": (1.00, 5.00),
 }
 
 # $ per image at 1024x1024 by quality; scaled by pixel count, ceil to cents.

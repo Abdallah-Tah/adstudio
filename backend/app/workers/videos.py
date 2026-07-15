@@ -20,6 +20,7 @@ from app.compiler.kling_fal import (
 )
 from app.providers import fal_client
 from app.schema import AssetRef, Generation, Project, Scene
+from app.stages import qc
 from app.snapshots import snapshot_project
 from app.storage import Storage
 from app.workers.celery_app import celery_app
@@ -42,6 +43,9 @@ def preflight_video(project: Project, scene: Scene) -> int:
     """Runtime checks before anything is created. Returns estimated cents."""
     if not os.environ.get("FAL_KEY"):
         raise ProviderNotConfigured("FAL_KEY is not configured")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        # QC is mandatory on every clip — don't spend on video we can't gate
+        raise ProviderNotConfigured("ANTHROPIC_API_KEY is not configured (QC)")
     if scene.selected_image is None:
         raise ValueError(
             f"scene {scene.scene_id} has no selected image — video generation "
@@ -140,7 +144,7 @@ def run_video_step(
         if state in ("IN_QUEUE", "IN_PROGRESS"):
             return "polling", poll
 
-        # COMPLETED — download and store
+        # COMPLETED — download, store, then QC-gate (stage 7)
         doc = fal_client.result(poll["response_url"])
         clip = fal_client.download(doc["video"]["url"])
         asset_id = f"ast_{uuid.uuid4().hex[:12]}"
@@ -152,8 +156,14 @@ def run_video_step(
             reference_assets=gen.reference_assets, created_at=_now(),
         )
         gen.cost_cents = video_cost_cents(scene.duration_s)
-        gen.status = "succeeded"
-        project.cost.videos += gen.cost_cents
+        project.cost.videos += gen.cost_cents  # provider billed either way
+
+        refs = [storage.get_bytes(a.uri)
+                for a in project.product.reference_images[:qc.MAX_REFERENCES]]
+        verdict, qc_cost = qc.run_qc(clip, refs, scene)
+        project.cost.qc += qc_cost
+        gen.qc_notes = verdict.notes
+        gen.status = "succeeded" if verdict.passed else "qc_rejected"
     except Exception as exc:
         gen.status = "failed"
         gen.qc_notes = f"provider error: {exc}"
@@ -165,6 +175,21 @@ def run_video_step(
     return gen.status, None
 
 
+def maybe_autoretry_qc(session, project_id: str, generation_id: str) -> str | None:
+    """After a qc_rejected clip: one automatic fresh attempt, but only while
+    the absolute cap allows it. Returns the new generation_id or None."""
+    row = session.get(db.ProjectRow, project_id)
+    project = Project.model_validate(row.data)
+    scene = next(s for s in project.scenes if any(
+        g.generation_id == generation_id for g in s.generations))
+    if video_attempts(scene) >= MAX_ATTEMPTS:
+        return None
+    retry = start_video_generation(session, project, scene.scene_id)
+    generate_scene_video.delay(
+        project_id=project_id, generation_id=retry.generation_id)
+    return retry.generation_id
+
+
 @celery_app.task(bind=True, name="app.workers.videos.generate_scene_video",
                  max_retries=MAX_POLLS)
 def generate_scene_video(self, project_id: str, generation_id: str,
@@ -174,6 +199,8 @@ def generate_scene_video(self, project_id: str, generation_id: str,
     try:
         state, next_poll = run_video_step(
             session, Storage(), project_id, generation_id, poll)
+        if state == "qc_rejected":
+            maybe_autoretry_qc(session, project_id, generation_id)
     finally:
         session.close()
     if state == "polling":

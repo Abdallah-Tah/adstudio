@@ -5,9 +5,33 @@ from httpx import Response
 
 from app.compiler import kling_fal
 from app.schema import Scene
+from app.stages.qc import QCVerdict, qc_cost_cents
 from app.workers import videos as video_worker
 
 from .conftest import create_test_project
+
+
+@pytest.fixture
+def video_env(monkeypatch):
+    """Both keys the video stage preflight requires (fal + QC)."""
+    monkeypatch.setenv("FAL_KEY", "fal-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test")
+
+
+@pytest.fixture
+def qc_pass(monkeypatch):
+    monkeypatch.setattr(video_worker.qc, "run_qc",
+                        lambda *a, **k: (QCVerdict(
+                            identity_ok=True, artifacts=False,
+                            notes="matches references"), 2))
+
+
+@pytest.fixture
+def qc_fail(monkeypatch):
+    monkeypatch.setattr(video_worker.qc, "run_qc",
+                        lambda *a, **k: (QCVerdict(
+                            identity_ok=False, artifacts=True,
+                            notes="product morphs mid-clip"), 2))
 
 FAL_URL = "https://queue.fal.run/fal-ai/kling-video/v3/standard/image-to-video"
 SUBMIT_DOC = {
@@ -62,8 +86,7 @@ def _selected_scene(client, eager_worker, good_provider):
 
 
 @respx.mock
-def test_video_requires_selected_image(client, monkeypatch):
-    monkeypatch.setenv("FAL_KEY", "fal-test")
+def test_video_requires_selected_image(client, video_env):
     project = create_test_project(client)
     pid, sid = project["project_id"], project["scenes"][0]["scene_id"]
     r = client.post(f"/projects/{pid}/scenes/{sid}/generate-video")
@@ -88,8 +111,7 @@ def test_video_preflight_missing_key_consumes_nothing(
 @respx.mock
 def test_video_full_flow_submit_poll_complete(
         client, sqlite_session, fake_storage, eager_worker, good_provider,
-        monkeypatch):
-    monkeypatch.setenv("FAL_KEY", "fal-test")
+        video_env, qc_pass, monkeypatch):
     pid, sid = _selected_scene(client, eager_worker, good_provider)
 
     # API enqueues (celery delay stubbed to no-op — we step manually)
@@ -131,6 +153,8 @@ def test_video_full_flow_submit_poll_complete(
     assert vgen["asset"]["kind"] == "video"
     assert vgen["cost_cents"] == 34            # 3.5s scene -> 4 billed s
     assert doc["cost"]["videos"] == 34
+    assert doc["cost"]["qc"] == 2              # QC metered per clip
+    assert vgen["qc_notes"] == "matches references"
     assert vgen["stale"] is False
 
     # select it; scene becomes video_ready
@@ -145,10 +169,60 @@ def test_video_full_flow_submit_poll_complete(
     assert client.get(f"/projects/{pid}").json()["cost"]["videos"] == 34
 
 
+def test_qc_cost_ceils_to_cents():
+    # 8 frames + 2 refs ≈ 12k input tokens on Haiku 4.5 → $0.012 → 2¢ ceil
+    assert qc_cost_cents("claude-haiku-4-5", 12_000, 200) == 2
+    assert qc_cost_cents("claude-haiku-4-5", 100, 10) == 1  # never undercount
+
+
+@respx.mock
+def test_qc_rejection_marks_and_autoretries(
+        client, sqlite_session, fake_storage, eager_worker, good_provider,
+        video_env, qc_fail, monkeypatch):
+    pid, sid = _selected_scene(client, eager_worker, good_provider)
+    delayed: list[str] = []
+    monkeypatch.setattr(
+        video_worker.generate_scene_video, "delay",
+        lambda **kw: delayed.append(kw["generation_id"]))
+
+    r = client.post(f"/projects/{pid}/scenes/{sid}/generate-video")
+    vgid = r.json()["generation_id"]
+
+    respx.post(FAL_URL).mock(return_value=Response(200, json=SUBMIT_DOC))
+    respx.get(SUBMIT_DOC["status_url"]).mock(
+        return_value=Response(200, json={"status": "COMPLETED"}))
+    respx.get(SUBMIT_DOC["response_url"]).mock(return_value=Response(
+        200, json={"video": {"url": "https://v3.fal.media/files/clip.mp4"}}))
+    respx.get("https://v3.fal.media/files/clip.mp4").mock(
+        return_value=Response(200, content=b"\x00fake"))
+
+    state, poll = video_worker.run_video_step(sqlite_session, fake_storage, pid, vgid, None)
+    assert state == "polling"
+    state, _ = video_worker.run_video_step(sqlite_session, fake_storage, pid, vgid, poll)
+    assert state == "qc_rejected"
+
+    doc = client.get(f"/projects/{pid}").json()
+    scene = doc["scenes"][0]
+    vgen = next(g for g in scene["generations"]
+                if g["generation_id"] == vgid)
+    assert vgen["status"] == "qc_rejected"
+    assert "morphs" in vgen["qc_notes"]
+    assert doc["cost"]["videos"] == 34   # provider billed even on rejection
+    assert doc["cost"]["qc"] == 2
+
+    # the worker auto-retries below the cap
+    retry_id = video_worker.maybe_autoretry_qc(sqlite_session, pid, vgid)
+    assert retry_id is not None
+    assert delayed == [vgid, retry_id]   # initial enqueue + fresh attempt
+    doc = client.get(f"/projects/{pid}").json()
+    videos = [g for g in doc["scenes"][0]["generations"] if g["kind"] == "video"]
+    assert len(videos) == 2              # append-only: rejected + retry queued
+
+
 @respx.mock
 def test_video_attempt_cap_absolute(client, sqlite_session, fake_storage,
-                                    eager_worker, good_provider, monkeypatch):
-    monkeypatch.setenv("FAL_KEY", "fal-test")
+                                    eager_worker, good_provider, video_env,
+                                    monkeypatch):
     pid, sid = _selected_scene(client, eager_worker, good_provider)
     monkeypatch.setattr(video_worker.generate_scene_video, "delay",
                         lambda **kw: None)
