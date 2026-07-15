@@ -78,14 +78,12 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def scene_spans(alignment: dict, scenes: list[Scene]) -> dict[str, tuple[float, float]]:
-    """Map each scene's vo_line to (start_s, end_s) in the full VO track."""
+def _locate(alignment: dict, scenes: list[Scene]) -> dict[str, tuple[int, int]]:
+    """Char-index range (first, last inclusive) of each scene's vo_line in the
+    full VO text, via the same normalized-cursor match as the validator."""
     joined = "".join(alignment["characters"])
-    starts = alignment["character_start_times_seconds"]
-    ends = alignment["character_end_times_seconds"]
     norm_text, idx_map = _norm_map(joined)
-
-    spans: dict[str, tuple[float, float]] = {}
+    ranges: dict[str, tuple[int, int]] = {}
     cursor = 0
     for scene in scenes:
         if not scene.vo_line:
@@ -96,8 +94,38 @@ def scene_spans(alignment: dict, scenes: list[Scene]) -> dict[str, tuple[float, 
             raise ValueError(
                 f"vo_line for scene {scene.scene_id} not found in VO alignment: "
                 f"{scene.vo_line!r}")
-        first = idx_map[pos]
-        last = idx_map[pos + len(line) - 1]
-        spans[scene.scene_id] = (float(starts[first]), float(ends[last]))
+        ranges[scene.scene_id] = (idx_map[pos], idx_map[pos + len(line) - 1])
         cursor = pos + len(line)
-    return spans
+    return ranges
+
+
+def scene_spans(alignment: dict, scenes: list[Scene]) -> dict[str, tuple[float, float]]:
+    """Map each scene's vo_line to (start_s, end_s) in the full VO track."""
+    starts = alignment["character_start_times_seconds"]
+    ends = alignment["character_end_times_seconds"]
+    return {
+        sid: (float(starts[first]), float(ends[last]))
+        for sid, (first, last) in _locate(alignment, scenes).items()
+    }
+
+
+def scene_words(alignment: dict, scenes: list[Scene]) -> dict[str, list[tuple[str, float, float]]]:
+    """Per-scene word timings [(word, start_s, end_s), ...] for captions."""
+    chars = alignment["characters"]
+    starts = alignment["character_start_times_seconds"]
+    ends = alignment["character_end_times_seconds"]
+    out: dict[str, list[tuple[str, float, float]]] = {}
+    for sid, (first, last) in _locate(alignment, scenes).items():
+        words: list[tuple[str, float, float]] = []
+        w_start: int | None = None
+        for i in range(first, last + 2):
+            is_ws = i > last or chars[i].isspace()
+            if is_ws:
+                if w_start is not None:
+                    word = "".join(chars[w_start:i])
+                    words.append((word, float(starts[w_start]), float(ends[i - 1])))
+                    w_start = None
+            elif w_start is None:
+                w_start = i
+        out[sid] = words
+    return out
