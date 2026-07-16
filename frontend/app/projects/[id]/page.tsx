@@ -8,9 +8,11 @@ import { cn } from "@/lib/utils";
 
 type Generation = {
   generation_id: string;
+  kind: string;
   status: string;
   stale?: boolean;
   cost_cents: number;
+  qc_notes: string | null;
   asset: { asset_id: string } | null;
   created_at: string;
 };
@@ -28,6 +30,7 @@ type Scene = {
   transition_out: string;
   generations: Generation[];
   selected_image: string | null;
+  selected_video: string | null;
   generation_attempts: number;
 };
 
@@ -40,8 +43,17 @@ type Project = {
   brief: { target_duration_s: number };
   scenes: Scene[];
   storyboard_approval: { status: string; approved_at: string | null };
+  final_render: { asset_id: string } | null;
   cost: Record<string, number> & { total: number };
 };
+
+function videoAttempts(s: Scene): number {
+  return s.generations.filter((g) => g.kind === "video").length;
+}
+
+function selectedVideoGen(s: Scene): Generation | undefined {
+  return s.generations.find((g) => g.generation_id === s.selected_video);
+}
 
 const INTENT_FIELDS = [
   ["action", "Action"],
@@ -156,6 +168,12 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
               Generate all scenes
             </Button>
           )}
+          {project.scenes.every((s) => s.selected_image) && !project.final_render && (
+            <Button size="sm" variant="accent"
+              onClick={() => act(() => postJSON(`/projects/${project.project_id}/produce`))}>
+              ✦ Produce ad
+            </Button>
+          )}
         </div>
         <div className="ml-auto flex gap-3 text-xs text-muted">
           {Object.entries(project.cost)
@@ -226,7 +244,23 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           "flex-1 flex-col items-center justify-center gap-3 overflow-y-auto p-4 md:flex",
           tab === "preview" ? "flex" : "hidden"
         )}>
-          {thumb?.asset ? (
+          {project.final_render && (
+            <div className="w-full max-w-xs space-y-1.5">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted">Final render</p>
+              <video controls playsInline
+                src={assetUrl(project.project_id, project.final_render.asset_id)}
+                className="aspect-[9/16] w-full rounded-xl bg-black shadow-lg" />
+              <a href={assetUrl(project.project_id, project.final_render.asset_id)}
+                 download className="block text-center text-xs text-accent hover:underline">
+                Download MP4
+              </a>
+            </div>
+          )}
+          {selectedVideoGen(scene)?.asset ? (
+            <video controls playsInline
+              src={assetUrl(project.project_id, selectedVideoGen(scene)!.asset!.asset_id)}
+              className="max-h-[55vh] rounded-xl bg-black shadow" />
+          ) : thumb?.asset ? (
             /* eslint-disable-next-line @next/next/no-img-element */
             <img src={assetUrl(project.project_id, thumb.asset.asset_id)} alt="" className="max-h-[62vh] rounded-xl shadow-lg" />
           ) : (
@@ -250,6 +284,15 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
                 Approve this image
               </Button>
             )}
+            {scene.selected_image && (
+              <Button
+                variant="outline"
+                onClick={() => act(() => postJSON(`/projects/${project.project_id}/scenes/${scene.scene_id}/generate-video`))}
+                disabled={videoAttempts(scene) >= 3}
+              >
+                {videoAttempts(scene) ? "Regen video" : "Generate video"} ({videoAttempts(scene)}/3)
+              </Button>
+            )}
           </div>
 
           {/* generation history */}
@@ -258,8 +301,18 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
               <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-muted">History</p>
               <div className="flex max-w-full gap-2 overflow-x-auto pb-1">
                 {scene.generations.map((g, gi) => (
-                  <div key={g.generation_id} className="w-24 shrink-0 text-center">
-                    {g.asset ? (
+                  <div key={g.generation_id} className="w-24 shrink-0 text-center"
+                       title={g.qc_notes ?? undefined}>
+                    {g.kind === "video" && g.asset ? (
+                      <video
+                        src={assetUrl(project.project_id, g.asset.asset_id)}
+                        muted playsInline
+                        onClick={() => g.status === "succeeded" &&
+                          act(() => postJSON(`/projects/${project.project_id}/scenes/${scene.scene_id}/select-video`, { generation_id: g.generation_id }))}
+                        className={cn("aspect-[9/16] w-full cursor-pointer rounded-lg bg-black object-cover",
+                          g.generation_id === scene.selected_video && "ring-2 ring-blue-500")}
+                      />
+                    ) : g.kind !== "video" && g.asset ? (
                       /* eslint-disable-next-line @next/next/no-img-element */
                       <img
                         src={assetUrl(project.project_id, g.asset.asset_id)}
@@ -271,11 +324,14 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
                     ) : (
                       <div className="flex aspect-[9/16] items-center justify-center rounded-lg bg-line/40 text-[10px] text-muted">{g.status}</div>
                     )}
-                    <div className="mt-1 text-[10px] text-muted">Gen {gi + 1}</div>
+                    <div className="mt-1 text-[10px] text-muted">{g.kind === "video" ? "Vid" : "Gen"} {gi + 1}</div>
                     <div className="flex justify-center gap-1">
                       <Badge tone={g.status}>{g.status}</Badge>
                       {g.stale && <Badge tone="stale">stale</Badge>}
                     </div>
+                    {g.status === "qc_rejected" && g.qc_notes && (
+                      <p className="mt-0.5 line-clamp-2 text-[9px] text-red-500">{g.qc_notes}</p>
+                    )}
                   </div>
                 ))}
               </div>

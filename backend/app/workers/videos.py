@@ -164,6 +164,9 @@ def run_video_step(
         project.cost.qc += qc_cost
         gen.qc_notes = verdict.notes
         gen.status = "succeeded" if verdict.passed else "qc_rejected"
+        if gen.status == "succeeded" and scene.selected_video is None:
+            # default selection so /produce can proceed; user can reselect
+            scene.selected_video = gen.generation_id
     except Exception as exc:
         gen.status = "failed"
         gen.qc_notes = f"provider error: {exc}"

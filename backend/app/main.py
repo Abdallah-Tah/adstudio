@@ -16,6 +16,7 @@ from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
 from app.storage import Storage
 from app.workers import images as image_worker
+from app.workers import produce as produce_worker
 from app.workers import videos as video_worker
 
 _session_factory = None
@@ -355,12 +356,15 @@ def generate_all_images(project_id: str, session: SessionDep) -> dict:
             "detail": "batch image generation requires explicit storyboard approval",
         })
     queued, skipped = [], []
-    for scene in project.scenes:
+    for scene_id in [s.scene_id for s in project.scenes]:
+        # reload each iteration: workers may have mutated the row in between
+        _, current = _load_project(session, project_id)
+        scene = next(s for s in current.scenes if s.scene_id == scene_id)
         if scene.selected_image:
             skipped.append({"scene_id": scene.scene_id, "reason": "image selected"})
             continue
         try:
-            generation = image_worker.start_generation(session, project, scene.scene_id)
+            generation = image_worker.start_generation(session, current, scene.scene_id)
         except image_worker.AttemptCapReached as exc:
             skipped.append({"scene_id": scene.scene_id, "reason": str(exc)})
             continue
@@ -463,6 +467,128 @@ def select_video(project_id: str, scene_id: str, body: SelectImage,
     return enriched(project)
 
 
+@app.post("/projects/{project_id}/produce")
+def produce(project_id: str, session: SessionDep) -> dict:
+    """Run stages 6→9. Refuses unless every scene has a selected image."""
+    import os
+
+    _, project = _load_project(session, project_id)
+    missing = [s.scene_id for s in project.scenes if not s.selected_image]
+    if missing:
+        raise HTTPException(422, {
+            "error_code": "SCENES_NOT_APPROVED",
+            "detail": f"every scene needs an approved image first; missing: {missing}",
+        })
+    for key in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
+        if not os.environ.get(key):
+            raise HTTPException(409, {
+                "error_code": "PROVIDER_NOT_CONFIGURED",
+                "detail": f"{key} is not configured",
+            })
+    queued = []
+    for scene_id in [s.scene_id for s in project.scenes]:
+        # reload each iteration: workers may have mutated the row in between
+        _, current = _load_project(session, project_id)
+        scene = next(s for s in current.scenes if s.scene_id == scene_id)
+        if scene.selected_video:
+            continue
+        if any(g.kind == "video" and g.status in ("queued", "running")
+               for g in scene.generations):
+            continue
+        try:
+            generation = video_worker.start_video_generation(
+                session, current, scene_id)
+        except video_worker.AttemptCapReached as exc:
+            raise HTTPException(409, str(exc))
+        video_worker.generate_scene_video.delay(
+            project_id=project_id, generation_id=generation.generation_id)
+        queued.append(generation.generation_id)
+    produce_worker.produce_project.delay(project_id)
+    return {"status": "producing", "video_generations_queued": queued}
+
+
+@app.get("/projects/{project_id}/status")
+def produce_status(project_id: str, session: SessionDep) -> dict:
+    """Per-scene statuses + current pipeline stage for the progress UI."""
+    _, project = _load_project(session, project_id)
+    scenes = []
+    any_video_activity = False
+    for s in sorted(project.scenes, key=lambda x: x.order):
+        active = [g for g in s.generations if g.status in ("queued", "running")]
+        if any(g.kind == "video" for g in s.generations):
+            any_video_activity = True
+        scenes.append({
+            "scene_id": s.scene_id, "order": s.order, "status": s.status,
+            "image_attempts": s.generation_attempts,
+            "video_attempts": video_worker.video_attempts(s),
+            "active": [{"generation_id": g.generation_id, "kind": g.kind,
+                        "status": g.status} for g in active],
+        })
+    if project.final_render:
+        stage = "done"
+    elif project.voiceover:
+        stage = "rendering"
+    elif any_video_activity:
+        stage = "videos"
+    elif all(s.selected_image for s in project.scenes):
+        stage = "images_ready"
+    elif any(s.generations for s in project.scenes):
+        stage = "images"
+    else:
+        stage = "storyboard"
+    return {"stage": stage, "scenes": scenes,
+            "final_render_asset_id":
+                project.final_render.asset_id if project.final_render else None}
+
+
+@app.get("/projects/{project_id}/report")
+def report(project_id: str, session: SessionDep) -> dict:
+    """Per-stage cost + wall-clock — the Gate 3 unit-economics numbers."""
+    _, project = _load_project(session, project_id)
+    versions = (
+        session.query(db.ProjectVersionRow)
+        .filter_by(project_id=project_id)
+        .order_by(db.ProjectVersionRow.created_at).all()
+    )
+
+    def first_ts(prefix: str):
+        return next((v.created_at for v in versions
+                     if v.reason.startswith(prefix)), None)
+
+    def last_ts(prefix: str):
+        return next((v.created_at for v in reversed(versions)
+                     if v.reason.startswith(prefix)), None)
+
+    def span(start_prefix: str, end_prefix: str):
+        a, b = first_ts(start_prefix), last_ts(end_prefix)
+        return round((b - a).total_seconds(), 1) if a and b else None
+
+    image_gens = [g for s in project.scenes for g in s.generations
+                  if g.kind == "image"]
+    video_gens = [g for s in project.scenes for g in s.generations
+                  if g.kind == "video"]
+    return {
+        "cost_cents": {**project.cost.model_dump(), "total": project.cost.total},
+        "wall_clock_s": {
+            "storyboard": span("stage1:", "stage4:"),
+            "images": span("generate-image queued", "generation succeeded"),
+            "videos": span("generate-video queued", "video generation succeeded"),
+            "produce": span("produce:voiceover", "produce:rendered"),
+        },
+        "counts": {
+            "scenes": len(project.scenes),
+            "image_generations": len(image_gens),
+            "image_regenerations": max(0, len(image_gens) - len(project.scenes)),
+            "video_generations": len(video_gens),
+            "qc_rejections": sum(1 for g in video_gens
+                                 if g.status == "qc_rejected"),
+        },
+        "duration_s": sum(s.duration_s for s in project.scenes),
+        "music_license": (project.music_license.model_dump(mode="json")
+                          if project.music_license else None),
+    }
+
+
 @app.get("/projects/{project_id}/assets/{asset_id}")
 def get_asset(project_id: str, asset_id: str, session: SessionDep,
               storage: StorageDep):
@@ -473,6 +599,12 @@ def get_asset(project_id: str, asset_id: str, session: SessionDep,
     assets = list(project.product.reference_images)
     for scene in project.scenes:
         assets += [g.asset for g in scene.generations if g.asset]
+    if project.voiceover and project.voiceover.asset:
+        assets.append(project.voiceover.asset)
+    if project.music:
+        assets.append(project.music)
+    if project.final_render:
+        assets.append(project.final_render)
     ref = next((a for a in assets if a.asset_id == asset_id), None)
     if ref is None:
         raise HTTPException(404, f"asset {asset_id} not found")

@@ -40,5 +40,5 @@ Pipeline: product photos → platform-ready TikTok ad (9:16 MP4), with human rev
 | 0 | Repo scaffold, compose, /health, schema round-trip test | ✅ Done — Gate 0 passed 2026-07-14 |
 | 1 (M0) | Storyboard engine (stages 1–4, API, CLI, styles, cost metering) | ✅ Done — Gate 1 passed 2026-07-14 (live prompt-quality review still owed once photos+key exist) |
 | 2 (M1) | Image loop + editor seed | **Gate 2 conditional hold — hardening done 2026-07-15.** Identity benchmark BLOCKED on product photos (`benchmark/README.md`). Real key wired, API + Celery worker running. |
-| 3 (M2) | Video, QC, audio, render | Decided at Gate 2: Kling v3 Standard via fal.ai (`generate_audio=false`) + licensed stock music catalog. Skeleton: `app/compiler/kling_fal.py`. **No paid video jobs until the 8/10 identity benchmark passes.** |
+| 3 (M2) | Video, QC, audio, render | **Built 2026-07-15 — at STOP GATE 3 pending live runs.** Kling v3/fal (audio off), crv+Haiku QC gate w/ capped auto-retry, ElevenLabs VO + timestamp spans, licensed music library (`music-add`), ffmpeg render (vendored freecut f1d4334), `/produce` + `/status` + `/report`, `qc-eval` CLI. Live exit criteria need: product photos (benchmark), FAL/ANTHROPIC/ELEVENLABS keys, licensed tracks. |
 | 4 (M3) | Beta instrumentation | Not started |

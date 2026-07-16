@@ -158,6 +158,50 @@ def cmd_music_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_qc_eval(args: argparse.Namespace) -> int:
+    """Gate 3 exit criterion: QC must catch >=80% of human-flagged defects.
+
+    labels.json: [{"clip": "path.mp4", "reference_images": ["ref1.png", ...],
+                   "action": "...", "camera": "...", "lighting": "...",
+                   "defect": true|false, "note": "why"}]
+    """
+    import json
+
+    from app.schema import Scene
+    from app.stages import qc
+
+    labels = json.loads(Path(args.labels).read_text())
+    caught = missed = false_alarms = clean_ok = 0
+    total_cost = 0
+    for i, item in enumerate(labels):
+        scene = Scene(scene_id=f"eval_{i}", order=i, duration_s=3.0,
+                      action=item.get("action", "product shot"),
+                      camera=item.get("camera", "static"),
+                      lighting=item.get("lighting", "studio"))
+        refs = [Path(p).read_bytes() for p in item["reference_images"]]
+        verdict, cost = qc.run_qc(Path(item["clip"]).read_bytes(), refs, scene)
+        total_cost += cost
+        rejected = not verdict.passed
+        if item["defect"] and rejected:
+            caught += 1
+        elif item["defect"] and not rejected:
+            missed += 1
+            print(f"MISSED  {item['clip']}: human={item.get('note')} "
+                  f"qc={verdict.notes}", file=sys.stderr)
+        elif not item["defect"] and rejected:
+            false_alarms += 1
+            print(f"FALSE+  {item['clip']}: qc={verdict.notes}", file=sys.stderr)
+        else:
+            clean_ok += 1
+    defects = caught + missed
+    rate = caught / defects * 100 if defects else 0.0
+    print(f"\ndefects caught: {caught}/{defects} ({rate:.0f}%)  "
+          f"false alarms: {false_alarms}  clean passed: {clean_ok}  "
+          f"qc spend: {total_cost}¢", file=sys.stderr)
+    print("PASS (>=80%)" if rate >= 80 else "FAIL (<80%)", file=sys.stderr)
+    return 0 if rate >= 80 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -194,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
                       help="e.g. upbeat warm cinematic minimal")
     madd.add_argument("--evidence", help="receipt/license PDF to store alongside")
     madd.set_defaults(func=cmd_music_add)
+
+    qeval = sub.add_parser("qc-eval",
+                           help="QC catch-rate vs human labels (Gate 3)")
+    qeval.add_argument("labels", help="labels.json (see cmd docstring)")
+    qeval.set_defaults(func=cmd_qc_eval)
 
     args = parser.parse_args(argv)
     return args.func(args)
