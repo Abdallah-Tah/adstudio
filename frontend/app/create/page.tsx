@@ -50,6 +50,9 @@ export default function CreateAd() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [description, setDescription] = useState("");
+  const [descLoading, setDescLoading] = useState(false);
+  const [descEdited, setDescEdited] = useState(false);
+  const [descError, setDescError] = useState("");
   const [brief, setBrief] = useState({ audience: "", offer: "", cta: "", tone: "" });
   const [style, setStyle] = useState<string>("");
   const [duration, setDuration] = useState(20);
@@ -57,6 +60,7 @@ export default function CreateAd() {
   const [running, setRunning] = useState(false);
   const [stageIdx, setStageIdx] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
+  const descReq = useRef(0);
 
   function addFiles(list: FileList | File[]) {
     const next = [...photos];
@@ -65,6 +69,40 @@ export default function CreateAd() {
     }
     setPhotos(next.slice(0, 8));
   }
+
+  // Auto-generate a description suggestion from up to 4 photos. It becomes an
+  // editable prefill; once the user edits it we stop overwriting their text.
+  async function generateDescription(current: Photo[]) {
+    if (current.length === 0) return;
+    const id = ++descReq.current;
+    setDescLoading(true);
+    setDescError("");
+    try {
+      const fd = new FormData();
+      current.slice(0, 4).forEach((p) => fd.append("photos", p.file));
+      const r = await fetch(`${API}/describe`, {
+        method: "POST", credentials: "include", body: fd,
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const { description: text } = await r.json();
+      if (id === descReq.current && !descEdited) setDescription(text);
+    } catch {
+      if (id === descReq.current) setDescError("Couldn't auto-describe — write one below.");
+    } finally {
+      if (id === descReq.current) setDescLoading(false);
+    }
+  }
+
+  // Regenerate when the photo set changes (unless the user has taken over).
+  useEffect(() => {
+    if (photos.length === 0) {
+      setDescription("");
+      setDescEdited(false);
+      return;
+    }
+    if (!descEdited) generateDescription(photos);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photos]);
 
   // simulated stage progress while the synchronous pipeline call runs
   useEffect(() => {
@@ -75,7 +113,7 @@ export default function CreateAd() {
   }, [running, stageIdx]);
 
   const canNext =
-    step === 0 ? photos.length > 0 && description.trim().length > 10 :
+    step === 0 ? photos.length > 0 && !descLoading && description.trim().length > 10 :
     step === 1 ? true :
     step === 2 ? true : true;
 
@@ -93,7 +131,7 @@ export default function CreateAd() {
     if (style) fd.append("style", style);
     fd.append("target_duration_s", String(duration));
     try {
-      const r = await fetch(`${API}/projects`, { method: "POST", body: fd });
+      const r = await fetch(`${API}/projects`, { method: "POST", credentials: "include", body: fd });
       if (!r.ok) throw new Error(await r.text());
       const project = await r.json();
       setStageIdx(PIPELINE.length);
@@ -200,14 +238,38 @@ export default function CreateAd() {
               </div>
             </div>
           )}
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-muted">Product description</span>
-            <textarea
-              rows={3} value={description} onChange={(e) => setDescription(e.target.value)}
-              placeholder="What is it, what makes it good, who is it for…"
-              className="w-full rounded-xl border border-line bg-surface p-3 text-sm focus:border-accent focus:outline-none"
-            />
-          </label>
+          {/* Description is generated from the photos — hidden until they exist */}
+          {photos.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted">
+                  Product description
+                  <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[9px] font-medium text-accent">
+                    {descLoading ? "generating…" : "✦ AI suggestion — edit if needed"}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => { setDescEdited(false); generateDescription(photos); }}
+                  disabled={descLoading}
+                  className="text-xs text-accent hover:underline disabled:opacity-50"
+                >
+                  Regenerate
+                </button>
+              </div>
+              <textarea
+                rows={3}
+                value={descLoading && !description ? "" : description}
+                onChange={(e) => { setDescription(e.target.value); setDescEdited(true); }}
+                placeholder={descLoading ? "Reading your photos…" : "Describe the product…"}
+                className={cn(
+                  "w-full rounded-xl border border-line bg-surface p-3 text-sm focus:border-accent focus:outline-none",
+                  descLoading && "animate-pulse text-muted"
+                )}
+              />
+              {descError && <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{descError}</p>}
+            </div>
+          )}
         </div>
       )}
 

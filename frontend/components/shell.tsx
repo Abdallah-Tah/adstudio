@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
-import { getJSON } from "@/lib/api";
+import { API, authStatus, getJSON } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -29,14 +29,35 @@ function useTheme() {
   return { dark, toggle };
 }
 
+async function logout() {
+  await fetch(`${API}/auth/logout`, { method: "POST", credentials: "include" });
+  window.location.href = "/login";
+}
+
 export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { dark, toggle } = useTheme();
   const [spend, setSpend] = useState<number | null>(null);
   const [providersOk, setProvidersOk] = useState<[number, number] | null>(null);
+  const [email, setEmail] = useState<string | null>(null);
+  const [authed, setAuthed] = useState<boolean | null>(null);
   const inEditor = pathname.startsWith("/projects/");
+  const isLogin = pathname === "/login";
+
+  // auth guard: bounce to /login when unauthenticated on a protected page
+  useEffect(() => {
+    if (isLogin) { setAuthed(true); return; }
+    authStatus()
+      .then((s) => {
+        setAuthed(s.authenticated);
+        setEmail(s.email);
+        if (!s.authenticated) window.location.href = "/login";
+      })
+      .catch(() => { window.location.href = "/login"; });
+  }, [pathname, isLogin]);
 
   useEffect(() => {
+    if (isLogin || !authed) return;
     getJSON("/projects")
       .then((ps: { cost_cents: number }[]) =>
         setSpend(ps.reduce((a, p) => a + p.cost_cents, 0)))
@@ -45,7 +66,15 @@ export function Shell({ children }: { children: React.ReactNode }) {
       .then((ps: { connected: boolean }[]) =>
         setProvidersOk([ps.filter((p) => p.connected).length, ps.length]))
       .catch(() => {});
-  }, [pathname]);
+  }, [pathname, authed, isLogin]);
+
+  // login page renders bare (no chrome); protected pages wait for the auth check
+  if (isLogin) return <>{children}</>;
+  if (authed === null || authed === false) {
+    return <div className="flex h-dvh items-center justify-center text-sm text-muted">Loading…</div>;
+  }
+
+  const initials = (email?.[0] ?? "A").toUpperCase() + (email?.[1] ?? "").toUpperCase();
 
   return (
     <div className="flex h-dvh overflow-hidden">
@@ -118,9 +147,23 @@ export function Shell({ children }: { children: React.ReactNode }) {
           >
             {dark ? "☀" : "☾"}
           </button>
-          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-line/60 text-xs font-semibold" title="Abdallah">
-            AB
-          </span>
+          <div className="group relative">
+            <button
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-line/60 text-xs font-semibold"
+              title={email ?? undefined}
+            >
+              {initials}
+            </button>
+            <div className="absolute right-0 top-9 z-10 hidden w-48 rounded-lg border border-line bg-surface p-2 shadow-lg group-hover:block">
+              <p className="truncate px-2 py-1 text-xs text-muted">{email}</p>
+              <button
+                onClick={logout}
+                className="mt-1 w-full rounded-md px-2 py-1.5 text-left text-sm hover:bg-line/40"
+              >
+                Log out
+              </button>
+            </div>
+          </div>
         </header>
 
         <main className={cn("min-h-0 flex-1", inEditor ? "overflow-hidden" : "overflow-y-auto")}>

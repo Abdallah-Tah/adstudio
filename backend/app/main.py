@@ -1,13 +1,14 @@
 """FastAPI entry point. Phase 1: schema export, project creation, scene edits."""
+import os
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Optional
 
-from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import db
+from app import auth, db
 from app.compiler.gpt_image import compile_image_prompt
 from app.pipeline import create_project
 from app.schema import Project, StoryboardApproval
@@ -43,16 +44,85 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AI Ad Studio", version="0.1.0", lifespan=lifespan)
+# Paths reachable without a session (login flow + liveness).
+_OPEN_PATHS = {"/health", "/schema", "/openapi.json", "/docs", "/redoc"}
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
+
+
+def get_current_user(request: Request, session: "Session" = Depends(get_session)):
+    """Global auth guard. Returns the current user's email, or None for open
+    paths. Raises 401 on any protected path without a valid session."""
+    path = request.url.path
+    if request.method == "OPTIONS" or path in _OPEN_PATHS or path.startswith("/auth/"):
+        return None
+    user = auth.user_for_token(session, request.cookies.get(auth.COOKIE_NAME))
+    if user is None:
+        raise HTTPException(401, "authentication required")
+    return user.email
+
+
+app = FastAPI(title="AI Ad Studio", version="0.1.0", lifespan=lifespan,
+              dependencies=[Depends(get_current_user)])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # editor v0, single-user localhost
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 SessionDep = Annotated[Session, Depends(get_session)]
 StorageDep = Annotated[Storage, Depends(get_storage)]
+
+
+# ------------------------------------------------------------------- auth ---
+
+class Credentials(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        auth.COOKIE_NAME, token, httponly=True, samesite="lax",
+        secure=COOKIE_SECURE, path="/",
+        max_age=int(auth.SESSION_TTL.total_seconds()))
+
+
+@app.get("/auth/status")
+def auth_status(request: Request, session: SessionDep) -> dict:
+    """Frontend bootstrap: is an owner registered, and am I logged in?"""
+    user = auth.user_for_token(session, request.cookies.get(auth.COOKIE_NAME))
+    return {"registered": auth.user_count(session) > 0,
+            "authenticated": user is not None,
+            "email": user.email if user else None}
+
+
+@app.post("/auth/register")
+def auth_register(body: Credentials, session: SessionDep,
+                  response: Response) -> dict:
+    """First-run owner signup only — closed once an account exists."""
+    if auth.user_count(session) > 0:
+        raise HTTPException(403, "registration is closed; an owner already exists")
+    user = auth.create_user(session, body.email, body.password)
+    _set_session_cookie(response, auth.create_session(session, user.user_id))
+    return {"email": user.email}
+
+
+@app.post("/auth/login")
+def auth_login(body: Credentials, session: SessionDep, response: Response) -> dict:
+    user = auth.authenticate(session, body.email, body.password)
+    if user is None:
+        raise HTTPException(401, "invalid email or password")
+    _set_session_cookie(response, auth.create_session(session, user.user_id))
+    return {"email": user.email}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request, session: SessionDep, response: Response) -> dict:
+    auth.revoke(session, request.cookies.get(auth.COOKIE_NAME))
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return {"ok": True}
 
 
 def enriched(project: Project) -> dict:
@@ -92,6 +162,22 @@ def health() -> dict:
 @app.get("/schema")
 def schema() -> dict:
     return Project.model_json_schema()
+
+
+@app.post("/describe")
+async def describe(photos: list[UploadFile]) -> dict:
+    """1-4 product photos -> a suggested, editable description (create-form prefill)."""
+    from app.stages import describe as describe_stage
+
+    if not photos:
+        raise HTTPException(422, "at least one photo is required")
+    payloads = [(await p.read(), p.content_type or "image/jpeg")
+                for p in photos[:describe_stage.MAX_PHOTOS]]
+    try:
+        text, cost = describe_stage.run(payloads)
+    except Exception as exc:
+        raise HTTPException(502, f"could not describe photos: {exc}")
+    return {"description": text, "cost_cents": cost}
 
 
 @app.post("/projects")

@@ -44,7 +44,7 @@ export default function Settings() {
   async function remove(id: string) {
     setBusy(id);
     try {
-      await fetch(`${API}/providers/${id}/key`, { method: "DELETE" });
+      await fetch(`${API}/providers/${id}/key`, { method: "DELETE", credentials: "include" });
       setMsg((m) => ({ ...m, [id]: "Key removed." }));
       refresh();
     } finally {

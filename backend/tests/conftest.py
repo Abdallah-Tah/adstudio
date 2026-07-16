@@ -113,13 +113,14 @@ def client(sqlite_session, fake_storage, monkeypatch):
     from fastapi.testclient import TestClient
 
     from app import pipeline
-    from app.main import app, get_session, get_storage
+    from app.main import app, get_current_user, get_session, get_storage
 
     monkeypatch.setattr(db, "init_db", lambda *a, **k: None)  # lifespan no-op
     monkeypatch.setattr(pipeline.segmentation, "segment",
                         lambda raw: (tiny_png(), None))
     app.dependency_overrides[get_session] = lambda: sqlite_session
     app.dependency_overrides[get_storage] = lambda: fake_storage
+    app.dependency_overrides[get_current_user] = lambda: "test@adstudio.local"
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
