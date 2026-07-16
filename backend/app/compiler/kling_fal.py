@@ -81,3 +81,14 @@ def compile_video_prompt(scene: Scene, style_id: str) -> CompiledVideoPrompt:
         prompt_hash=hashlib.sha256(prompt.encode()).hexdigest(),
         start_image_generation_id=scene.selected_image,
     )
+
+
+def build_payload(compiled: CompiledVideoPrompt, start_image_uri: str) -> dict:
+    """Kling's fal input schema (start_image_url + whole-second duration)."""
+    return {
+        "prompt": compiled.prompt,
+        "negative_prompt": compiled.negative_prompt,
+        "start_image_url": start_image_uri,
+        "duration": str(compiled.billed_duration_s),
+        "generate_audio": GENERATE_AUDIO,
+    }

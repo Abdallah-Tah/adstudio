@@ -12,12 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from app import db
-from app.compiler.kling_fal import (
-    GENERATE_AUDIO,
-    VIDEO_MODEL,
-    compile_video_prompt,
-    video_cost_cents,
-)
+from app.compiler import engines
 from app.providers import fal_client
 from app.schema import AssetRef, Generation, Project, Scene
 from app.stages import qc
@@ -58,7 +53,7 @@ def preflight_video(project: Project, scene: Scene) -> int:
         raise AttemptCapReached(
             f"scene {scene.scene_id} already used {video_attempts(scene)}/"
             f"{MAX_ATTEMPTS} video attempts")
-    return video_cost_cents(scene.duration_s)
+    return engines.active_engine().video_cost_cents(scene.duration_s)
 
 
 def _save(session, project: Project, reason: str) -> None:
@@ -71,7 +66,8 @@ def start_video_generation(session, project: Project, scene_id: str) -> Generati
     """Create the queued video Generation (preflight passes FIRST)."""
     scene = next(s for s in project.scenes if s.scene_id == scene_id)
     preflight_video(project, scene)
-    compiled = compile_video_prompt(scene, project.strategy.style_id)
+    compiled = engines.active_engine().compile_video_prompt(
+        scene, project.strategy.style_id)
     start_gen = next(g for g in scene.generations
                      if g.generation_id == scene.selected_image)
     generation = Generation(
@@ -119,20 +115,17 @@ def run_video_step(
     if gen.status in ("succeeded", "failed", "qc_rejected"):
         return gen.status, None    # idempotent completion (append-only ledger)
 
+    # the engine that MADE this generation owns its payload + pricing
+    engine = engines.by_model(gen.model) or engines.active_engine()
     try:
         if poll is None:
             # SUBMIT — build payload from the selected image + compiled prompt
-            compiled = compile_video_prompt(scene, project.strategy.style_id)
+            compiled = engine.compile_video_prompt(scene, project.strategy.style_id)
             start_gen = next(g for g in scene.generations
                              if g.generation_id == scene.selected_image)
             image = storage.get_bytes(start_gen.asset.uri)
-            poll = fal_client.submit(VIDEO_MODEL, {
-                "prompt": compiled.prompt,
-                "negative_prompt": compiled.negative_prompt,
-                "start_image_url": fal_client.data_uri(image),
-                "duration": str(compiled.billed_duration_s),
-                "generate_audio": GENERATE_AUDIO,
-            })
+            poll = fal_client.submit(
+                gen.model, engine.build_payload(compiled, fal_client.data_uri(image)))
             gen.status = "running"
             _save(session, project, f"video generation submitted {generation_id} "
                                     f"(fal {poll['request_id']})")
@@ -155,7 +148,7 @@ def run_video_step(
             generated_from=scene.scene_id,
             reference_assets=gen.reference_assets, created_at=_now(),
         )
-        gen.cost_cents = video_cost_cents(scene.duration_s)
+        gen.cost_cents = engine.video_cost_cents(scene.duration_s)
         project.cost.videos += gen.cost_cents  # provider billed either way
 
         refs = [storage.get_bytes(a.uri)

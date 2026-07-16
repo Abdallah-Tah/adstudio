@@ -169,6 +169,51 @@ def test_video_full_flow_submit_poll_complete(
     assert client.get(f"/projects/{pid}").json()["cost"]["videos"] == 34
 
 
+LTX_URL = "https://queue.fal.run/fal-ai/ltxv-13b-098-distilled/image-to-video"
+LTX_SUBMIT = {
+    "request_id": "req_ltx",
+    "status_url": f"{LTX_URL}/requests/req_ltx/status",
+    "response_url": f"{LTX_URL}/requests/req_ltx",
+}
+
+
+@respx.mock
+def test_video_flow_routes_to_selected_ltx_engine(
+        client, sqlite_session, fake_storage, eager_worker, good_provider,
+        video_env, qc_pass, monkeypatch):
+    monkeypatch.setenv("VIDEO_ENGINE", "ltx")
+    pid, sid = _selected_scene(client, eager_worker, good_provider)
+    monkeypatch.setattr(video_worker.generate_scene_video, "delay",
+                        lambda **kw: None)
+    vgid = client.post(f"/projects/{pid}/scenes/{sid}/generate-video").json()["generation_id"]
+
+    respx.post(LTX_URL).mock(return_value=Response(200, json=LTX_SUBMIT))
+    respx.get(LTX_SUBMIT["status_url"]).mock(
+        return_value=Response(200, json={"status": "COMPLETED"}))
+    respx.get(LTX_SUBMIT["response_url"]).mock(return_value=Response(
+        200, json={"video": {"url": "https://v3.fal.media/ltx.mp4"}}))
+    respx.get("https://v3.fal.media/ltx.mp4").mock(
+        return_value=Response(200, content=b"\x00ltx"))
+
+    state, poll = video_worker.run_video_step(sqlite_session, fake_storage, pid, vgid, None)
+    assert state == "polling"
+    # request hit the LTX endpoint with LTX param names (not kling's)
+    submitted = respx.calls[-1].request
+    assert "ltxv-13b-098-distilled" in str(submitted.url)
+    body = submitted.read()
+    assert b'"num_frames"' in body and b'"expand_prompt"' in body
+    assert b'"start_image_url"' not in body and b'"generate_audio"' not in body
+
+    state, _ = video_worker.run_video_step(sqlite_session, fake_storage, pid, vgid, poll)
+    assert state == "succeeded"
+    doc = client.get(f"/projects/{pid}").json()
+    vgen = next(g for g in doc["scenes"][0]["generations"] if g["kind"] == "video")
+    assert vgen["model"] == "fal-ai/ltxv-13b-098-distilled/image-to-video"
+    assert vgen["cost_cents"] == 7             # LTX ~5x cheaper than kling's 34
+    assert doc["cost"]["videos"] == 7
+    assert vgen["stale"] is False              # staleness recomputed per-engine
+
+
 def test_qc_cost_ceils_to_cents():
     # 8 frames + 2 refs ≈ 12k input tokens on Haiku 4.5 → $0.012 → 2¢ ceil
     assert qc_cost_cents("claude-haiku-4-5", 12_000, 200) == 2

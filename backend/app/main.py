@@ -59,25 +59,27 @@ def enriched(project: Project) -> dict:
     """Project JSON with computed (not stored) staleness on image generations:
     a generation is stale when its prompt_hash no longer matches the hash of
     the prompt compiled from the scene's current intent."""
-    from app.compiler.kling_fal import compile_video_prompt
+    from app.compiler import engines
 
     doc = project.model_dump(mode="json")
     for scene, scene_doc in zip(project.scenes, doc["scenes"]):
         current_img = compile_image_prompt(
             scene, project.strategy.style_id, project.product
         ).prompt_hash
-        current_vid = (
-            compile_video_prompt(scene, project.strategy.style_id).prompt_hash
-            if scene.selected_image else None
-        )
         for gen_doc in scene_doc["generations"]:
             if gen_doc["kind"] == "image":
                 gen_doc["stale"] = gen_doc["prompt_hash"] != current_img
+            elif scene.selected_image:
+                # recompute against the engine that produced this video, so a
+                # video is stale only when the scene intent actually changed
+                engine = engines.by_model(gen_doc["model"])
+                current_vid = (engine.compile_video_prompt(
+                    scene, project.strategy.style_id).prompt_hash
+                    if engine else None)
+                gen_doc["stale"] = (current_vid is not None
+                                    and gen_doc["prompt_hash"] != current_vid)
             else:
-                gen_doc["stale"] = (
-                    current_vid is not None
-                    and gen_doc["prompt_hash"] != current_vid
-                )
+                gen_doc["stale"] = False
     doc["cost"]["total"] = project.cost.total
     return doc
 
@@ -202,20 +204,23 @@ def providers() -> list[dict]:
     """Read-only provider connection status (from backend-only env config)."""
     import os
 
+    from app.compiler import engines
     from app.compiler.gpt_image import IMAGE_MODEL
-    from app.compiler.kling_fal import VIDEO_MODEL
     from app.providers.openai_client import STAGE_MODEL
 
     def ok(key: str) -> bool:
         return bool(os.environ.get(key))
 
+    active = engines.active_name()
     return [
         {"id": "openai", "name": "OpenAI",
          "role": "Product analysis, strategy, storyboard + image generation",
          "models": [STAGE_MODEL, IMAGE_MODEL], "connected": ok("OPENAI_API_KEY")},
         {"id": "fal", "name": "fal.ai",
-         "role": "Video generation — Kling v3 Standard, audio off (Phase 3)",
-         "models": [VIDEO_MODEL], "connected": ok("FAL_KEY")},
+         "role": f"Video generation (Phase 3) — active engine: {active}, audio off",
+         "models": [m.VIDEO_MODEL for m in engines.ENGINES.values()],
+         "active_model": engines.active_engine().VIDEO_MODEL,
+         "connected": ok("FAL_KEY")},
         {"id": "anthropic", "name": "Anthropic",
          "role": "Vision QC verdicts on generated clips (Phase 3)",
          "models": [], "connected": ok("ANTHROPIC_API_KEY")},

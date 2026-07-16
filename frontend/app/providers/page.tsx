@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getJSON } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 
@@ -10,6 +11,7 @@ type Provider = {
   name: string;
   role: string;
   models: string[];
+  active_model?: string;
   connected: boolean;
 };
 
@@ -44,11 +46,16 @@ export default function Providers() {
               <p className="text-xs text-muted">{p.role}</p>
               {p.models.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
-                  {p.models.map((m) => (
-                    <span key={m} className="rounded-md bg-line/50 px-2 py-0.5 font-mono text-[10px]">
-                      {m}
-                    </span>
-                  ))}
+                  {p.models.map((m) => {
+                    const active = p.active_model === m;
+                    return (
+                      <span key={m}
+                        className={cn("rounded-md px-2 py-0.5 font-mono text-[10px]",
+                          active ? "bg-accent/15 text-accent ring-1 ring-accent/40" : "bg-line/50")}>
+                        {m}{active && p.models.length > 1 ? " · active" : ""}
+                      </span>
+                    );
+                  })}
                 </div>
               )}
             </Card>

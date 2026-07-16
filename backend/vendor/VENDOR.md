@@ -1,5 +1,19 @@
 # Vendored code
 
+## LTX-Video (Lightricks) — conventions only, not code
+
+- **Source:** https://github.com/Lightricks/LTX-Video (pip `ltx-video`, import `ltx_video`)
+- **Why not vendored as code:** the `ltx_video` pipeline is a CUDA/H100 model and
+  cannot run on this Pi. We use it through fal's hosted endpoint
+  `fal-ai/ltxv-13b-098-distilled/image-to-video`, which runs Lightricks' own
+  pipeline server-side.
+- **What we adopt from their library** (in `app/compiler/ltx_fal.py`, with
+  attribution comments): (1) the `num_frames = 8k+1` VAE temporal-stride rule,
+  (2) their recommended negative prompt, (3) `expand_prompt=True` = their
+  "Automatic Prompt Enhancement" (`enhance_prompt`). Verified against their repo
+  + the fal API docs on 2026-07-15.
+
+
 ## freecut
 
 - **Source:** local repo `~/Developer/freecut` (the freecut editing toolkit)
