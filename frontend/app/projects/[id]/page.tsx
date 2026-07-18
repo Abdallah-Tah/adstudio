@@ -250,6 +250,21 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
               <video controls playsInline
                 src={assetUrl(project.project_id, project.final_render.asset_id)}
                 className="aspect-[9/16] w-full rounded-xl bg-black shadow-lg" />
+              <div className="rounded-lg border border-line bg-surface px-3 py-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted">Spent on this video</span>
+                  <span className="text-sm font-semibold text-ink">
+                    ${(project.cost.total / 100).toFixed(2)}
+                  </span>
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-muted">
+                  {Object.entries(project.cost)
+                    .filter(([k, v]) => k !== "total" && v > 0)
+                    .map(([k, v]) => (
+                      <span key={k}>{k} ${(v / 100).toFixed(2)}</span>
+                    ))}
+                </div>
+              </div>
               <a href={assetUrl(project.project_id, project.final_render.asset_id)}
                  download className="block text-center text-xs text-accent hover:underline">
                 Download MP4
