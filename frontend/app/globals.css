@@ -3,39 +3,170 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --bg: #fafafa;
+  /* neutrals */
+  --bg: #f7f7f8;
   --surface: #ffffff;
-  --line: #e7e5e4;
+  --surface-2: #fbfbfc;
+  --surface-hover: #f4f4f5;
+  --line: #e8e8ec;
+  --line-strong: #d4d4d8;
   --ink: #18181b;
+  --ink-2: #3f3f46;
   --muted: #71717a;
+  --muted-2: #a1a1aa;
+
+  /* brand — violet is the "AI action" primary */
   --accent: #7c3aed;
+  --accent-2: #6d28d9;
+  --accent-soft: #f3effe;
   --accent-ink: #ffffff;
+
+  /* semantic */
+  --success: #059669;
+  --success-soft: #ecfdf5;
+  --info: #2563eb;
+  --info-soft: #eff6ff;
+  --warn: #d97706;
+  --warn-soft: #fffbeb;
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+
+  --ring: color-mix(in srgb, var(--accent) 45%, transparent);
+
+  --radius: 0.75rem;
 }
 
 .dark {
-  --bg: #09090b;
-  --surface: #131316;
-  --line: #27272a;
+  --bg: #08080a;
+  --surface: #121216;
+  --surface-2: #17171c;
+  --surface-hover: #1d1d23;
+  --line: #26262b;
+  --line-strong: #34343b;
   --ink: #f4f4f5;
+  --ink-2: #d4d4d8;
   --muted: #a1a1aa;
+  --muted-2: #71717a;
+
   --accent: #8b5cf6;
+  --accent-2: #a78bfa;
+  --accent-soft: #1e1633;
   --accent-ink: #ffffff;
+
+  --success: #10b981;
+  --success-soft: #052e22;
+  --info: #3b82f6;
+  --info-soft: #0b1e3d;
+  --warn: #f59e0b;
+  --warn-soft: #2a1e05;
+  --danger: #ef4444;
+  --danger-soft: #300f0f;
+
+  --ring: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 @theme inline {
   --color-bg: var(--bg);
   --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-hover: var(--surface-hover);
   --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
   --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
   --color-muted: var(--muted);
+  --color-muted-2: var(--muted-2);
+
   --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-accent-soft: var(--accent-soft);
   --color-accent-ink: var(--accent-ink);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+
+  --radius-lg: var(--radius);
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --animate-fade-in: fade-in 0.25s ease both;
+  --animate-slide-up: slide-up 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-shimmer: shimmer 1.4s ease-in-out infinite;
+  --animate-pulse-ring: pulse-ring 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 var(--ring); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
 
 body {
   @apply bg-bg text-ink;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 }
+
+/* typography scale — semantic helpers layered on utilities */
+@layer components {
+  .text-display { @apply text-3xl font-semibold tracking-tight md:text-[2rem] md:leading-[1.15]; }
+  .text-h1 { @apply text-xl font-semibold tracking-tight; }
+  .text-h2 { @apply text-base font-semibold tracking-tight; }
+  .text-h3 { @apply text-sm font-semibold; }
+  .text-body { @apply text-sm text-ink-2; }
+  .text-secondary { @apply text-sm text-muted; }
+  .text-caption { @apply text-xs text-muted; }
+  .text-overline { @apply text-[11px] font-semibold uppercase tracking-wider text-muted; }
+
+  .card-hover { @apply transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md hover:border-line-strong; }
+  .focus-ring { @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] focus-visible:ring-offset-1 focus-visible:ring-offset-bg; }
+
+  .skeleton {
+    background: linear-gradient(90deg,
+      color-mix(in srgb, var(--line) 60%, transparent) 25%,
+      color-mix(in srgb, var(--line) 20%, transparent) 37%,
+      color-mix(in srgb, var(--line) 60%, transparent) 63%);
+    background-size: 200% 100%;
+    animation: var(--animate-shimmer);
+  }
+}
+
+/* refined scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--muted-2); background-clip: content-box; }
 
 ::selection {
   background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
