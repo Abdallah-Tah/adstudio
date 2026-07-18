@@ -396,6 +396,9 @@ function PreviewPane({
   const imageGens = scene.generations.filter((g) => g.kind !== "video" && g.status === "succeeded" && g.asset);
   const canCompare = imageGens.length >= 2 && !vid;
   const currentAsset = vid?.asset ?? thumb?.asset ?? null;
+  // most recent terminal failure (surfaced when there's nothing to preview)
+  const lastFailed = [...scene.generations].reverse()
+    .find((g) => g.status === "failed" || g.status === "qc_rejected");
 
   function fullscreen() {
     wrapRef.current?.requestFullscreen?.().catch(() => {});
@@ -445,6 +448,25 @@ function PreviewPane({
           <img src={assetUrl(pid, thumb.asset.asset_id)} alt=""
             style={{ transform: `scale(${zoom})` }}
             className="max-h-full rounded-xl shadow-lg transition-transform" />
+        ) : lastFailed ? (
+          <div className="w-full max-w-sm">
+            <div className="flex aspect-[9/16] max-h-[55vh] flex-col items-center justify-center rounded-xl border border-dashed border-danger/40 bg-danger-soft/40">
+              <EmptyState
+                icon={<span className="text-danger"><Icon name="refresh" size={22} /></span>}
+                title={lastFailed.status === "qc_rejected" ? "QC rejected this generation" : "Generation failed"}
+                description={lastFailed.qc_notes ?? "The provider returned an error."}
+                action={
+                  scene.generation_attempts < 3 ? (
+                    <Button variant="ai" onClick={onGenImage}>
+                      <Icon name="refresh" size={15} /> Retry ({scene.generation_attempts}/3)
+                    </Button>
+                  ) : (
+                    <span className="text-xs text-muted">Attempt cap reached (3/3).</span>
+                  )
+                }
+              />
+            </div>
+          </div>
         ) : (
           <div className="w-full max-w-sm">
             <div className="flex aspect-[9/16] max-h-[55vh] flex-col items-center justify-center rounded-xl border border-dashed border-line bg-surface">

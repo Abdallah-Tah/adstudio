@@ -29,6 +29,9 @@ class Generation(BaseModel):
     cost_cents: int = 0
     asset: Optional[AssetRef] = None
     created_at: str
+    # Set when the worker transitions the job to "running"; used by the watchdog
+    # to time out jobs whose worker died or hung (see app.workers.reaper).
+    started_at: Optional[str] = None
 
 
 class ProcessingWarning(BaseModel):

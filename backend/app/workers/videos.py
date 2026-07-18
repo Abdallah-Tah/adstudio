@@ -127,6 +127,7 @@ def run_video_step(
             poll = fal_client.submit(
                 gen.model, engine.build_payload(compiled, fal_client.data_uri(image)))
             gen.status = "running"
+            gen.started_at = _now()
             _save(session, project, f"video generation submitted {generation_id} "
                                     f"(fal {poll['request_id']})")
             session.commit()

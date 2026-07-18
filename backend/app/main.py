@@ -356,7 +356,13 @@ def clear_provider_key(provider_id: str) -> dict:
 
 @app.get("/projects/{project_id}")
 def get_project(project_id: str, session: SessionDep) -> dict:
-    return enriched(_load_project(session, project_id)[1])
+    from app.workers import reaper
+    project = _load_project(session, project_id)[1]
+    # Watchdog: converge any jobs orphaned by a dead/hung worker to "failed"
+    # before returning, so the polling UI never sees "running" forever.
+    if reaper.reap_stuck(session, project):
+        project = _load_project(session, project_id)[1]
+    return enriched(project)
 
 
 @app.get("/projects/{project_id}/versions")
@@ -685,6 +691,92 @@ def report(project_id: str, session: SessionDep) -> dict:
         "duration_s": sum(s.duration_s for s in project.scenes),
         "music_license": (project.music_license.model_dump(mode="json")
                           if project.music_license else None),
+    }
+
+
+@app.get("/debug/jobs")
+def debug_jobs(session: SessionDep) -> dict:
+    """Developer diagnostics: every generation's live state + worker/queue health.
+
+    Read-only. Surfaces exactly where a job is stuck: queued (no worker),
+    running (in-flight or hung), or terminal. No prompts/secrets are exposed.
+    """
+    import os
+    from datetime import datetime, timezone
+
+    from app.workers import reaper
+
+    def elapsed(ts: str | None) -> float | None:
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return round((datetime.now(timezone.utc) - dt).total_seconds(), 1)
+        except ValueError:
+            return None
+
+    STEP = {"queued": "waiting for worker", "running": "provider call in-flight",
+            "succeeded": "done", "failed": "failed", "qc_rejected": "QC rejected"}
+
+    # attempt counts live on the scene, keyed for lookup
+    attempts: dict[str, int] = {}
+    for row in session.query(db.ProjectRow).all():
+        for s in row.data.get("scenes", []):
+            for g in s.get("generations", []):
+                attempts[g["generation_id"]] = s.get("generation_attempts", 0)
+
+    jobs = []
+    for r in session.query(db.GenerationRow).order_by(db.GenerationRow.generation_id).all():
+        d = r.data
+        active = d.get("status") in ("queued", "running")
+        jobs.append({
+            "generation_id": r.generation_id, "project_id": r.project_id,
+            "scene_id": r.scene_id, "kind": d.get("kind"), "status": d.get("status"),
+            "provider": d.get("provider"), "model": d.get("model"),
+            "attempts": attempts.get(r.generation_id),
+            "created_at": d.get("created_at"), "started_at": d.get("started_at"),
+            "elapsed_s": elapsed(d.get("started_at") or d.get("created_at")) if active else None,
+            "current_step": STEP.get(d.get("status"), d.get("status")),
+            "cost_cents": d.get("cost_cents", 0),
+            "note": d.get("qc_notes"),
+        })
+
+    # worker + queue health
+    from app.workers.celery_app import celery_app
+    workers: dict = {"registered": None, "active": None, "reserved": None, "alive": False}
+    try:
+        insp = celery_app.control.inspect(timeout=1.0)
+        reg = insp.registered() or {}
+        workers = {
+            "alive": bool(reg),
+            "registered": reg,
+            "active": insp.active() or {},
+            "reserved": insp.reserved() or {},
+        }
+    except Exception as exc:  # pragma: no cover - inspect best-effort
+        workers["error"] = str(exc)
+
+    queue_len = None
+    try:
+        import redis
+        rc = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+        queue_len = rc.llen("celery")
+    except Exception:
+        pass
+
+    return {
+        "jobs": jobs,
+        "counts": {
+            "queued": sum(1 for j in jobs if j["status"] == "queued"),
+            "running": sum(1 for j in jobs if j["status"] == "running"),
+            "failed": sum(1 for j in jobs if j["status"] == "failed"),
+            "succeeded": sum(1 for j in jobs if j["status"] == "succeeded"),
+        },
+        "worker": workers,
+        "queue_length": queue_len,
+        "watchdog": {"run_timeouts_s": reaper.RUN_TIMEOUTS, "queue_timeout_s": reaper.QUEUE_TIMEOUT},
     }
 
 

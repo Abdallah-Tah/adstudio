@@ -20,11 +20,20 @@ T = TypeVar("T", bound=BaseModel)
 
 _client: OpenAI | None = None
 
+# Hard network timeout (seconds) + no SDK-level retries: a hung provider call
+# fails fast with a clear error instead of stalling a worker forever. Our own
+# attempt cap + watchdog handle retries/timeouts.
+REQUEST_TIMEOUT = 90.0
+
 
 def client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        _client = OpenAI(
+            api_key=os.environ["OPENAI_API_KEY"],
+            timeout=REQUEST_TIMEOUT,
+            max_retries=0,
+        )
     return _client
 
 

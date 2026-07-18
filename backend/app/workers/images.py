@@ -3,9 +3,13 @@
 The Generation ledger is append-only: a new Generation row/entry per attempt,
 never mutated after reaching a terminal status.
 """
+import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
+
+from celery.exceptions import SoftTimeLimitExceeded
 
 from app import db
 from app.compiler.gpt_image import (
@@ -21,6 +25,8 @@ from app.storage import Storage
 from app.workers.celery_app import celery_app
 
 MAX_ATTEMPTS = 3
+
+log = logging.getLogger("adstudio.images")
 
 
 def _now() -> str:
@@ -105,21 +111,29 @@ def run_generation(session, storage: Storage, project_id: str, generation_id: st
                  if any(g.generation_id == generation_id for g in s.generations))
     gen = next(g for g in scene.generations if g.generation_id == generation_id)
     if gen.status != "queued":
+        log.info("skip %s: already %s (append-only)", generation_id, gen.status)
         return gen.status  # terminal statuses are immutable (append-only ledger)
 
     gen.status = "running"
+    gen.started_at = _now()
     _save(session, project, f"generation running {generation_id}")
     session.commit()
+    log.info("started generation=%s scene=%s model=%s", generation_id, scene.scene_id, gen.model)
 
+    t0 = time.monotonic()
     try:
         by_id = {a.asset_id: a for a in project.product.reference_images}
         refs = [storage.get_bytes(by_id[aid].uri) for aid in gen.reference_assets]
+        log.info("calling provider=%s model=%s refs=%d", gen.provider, gen.model, len(refs))
         png, cost = openai_images.generate_image(
             gen.prompt, refs, IMAGE_SIZE, IMAGE_QUALITY, gen.model
         )
+        latency = round(time.monotonic() - t0, 1)
+        log.info("received image gen=%s bytes=%d latency=%ss status=ok", generation_id, len(png), latency)
         asset_id = f"ast_{uuid.uuid4().hex[:12]}"
         uri = storage.put_bytes(
             png, f"{project_id}/images/{asset_id}.png", "image/png")
+        log.info("uploaded asset=%s gen=%s", asset_id, generation_id)
         gen.asset = AssetRef(
             asset_id=asset_id, kind="image", uri=uri,
             generated_from=scene.scene_id,
@@ -128,11 +142,18 @@ def run_generation(session, storage: Storage, project_id: str, generation_id: st
         gen.cost_cents = cost
         gen.status = "succeeded"
         project.cost.images += cost
+    except SoftTimeLimitExceeded:
+        gen.status = "failed"
+        gen.qc_notes = "timed out (exceeded soft time limit)"
+        log.warning("timeout gen=%s after %ss", generation_id, round(time.monotonic() - t0, 1))
     except Exception as exc:
         gen.status = "failed"
-        gen.qc_notes = f"provider error: {exc}"
+        gen.qc_notes = f"provider error: {type(exc).__name__}: {exc}"
+        log.warning("failed gen=%s provider=%s error=%s: %s",
+                    generation_id, gen.provider, type(exc).__name__, exc)
 
     _save(session, project, f"generation {gen.status} {generation_id}")
+    log.info("completed gen=%s status=%s", generation_id, gen.status)
     gen_row = session.get(db.GenerationRow, generation_id)
     gen_row.data = gen.model_dump(mode="json")
     session.commit()
