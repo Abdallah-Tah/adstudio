@@ -19,6 +19,26 @@ PROVIDER_KEYS: dict[str, str] = {
 }
 
 
+def load_env() -> None:
+    """Populate os.environ from the .env file at process startup.
+
+    Keys are written to .env so they survive restarts, but nothing else reads
+    it back — without this, a restart (or reboot) silently drops every provider
+    key and generation 500s on a missing key. Stdlib parse (no dotenv dep). A
+    value already present in the real environment always wins over the file.
+    """
+    if not ENV_FILE.exists():
+        return
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        var, _, value = line.partition("=")
+        var, value = var.strip(), value.strip()
+        if var and value and var not in os.environ:
+            os.environ[var] = value
+
+
 def _upsert(var: str, value: str) -> None:
     lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
     entry = f"{var}={value}"

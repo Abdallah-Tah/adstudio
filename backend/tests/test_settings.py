@@ -33,3 +33,26 @@ def test_set_and_clear_provider_key(client, tmp_path, monkeypatch):
     # too-short key rejected by validation
     assert client.post("/providers/fal/key",
                        json={"api_key": "short"}).status_code == 422
+
+
+def test_load_env_populates_environ(tmp_path, monkeypatch):
+    """Keys written to .env are read back into os.environ on startup so they
+    survive a process restart; a real environment value is not overridden."""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# a comment\n"
+        "\n"
+        "OPENAI_API_KEY=sk-from-file\n"
+        "ANTHROPIC_API_KEY=ant-from-file\n"
+        "ALREADY_SET=file-value\n"
+    )
+    monkeypatch.setattr(settings_store, "ENV_FILE", env_file)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ALREADY_SET", "real-env-value")
+
+    settings_store.load_env()
+
+    assert os.environ["OPENAI_API_KEY"] == "sk-from-file"
+    assert os.environ["ANTHROPIC_API_KEY"] == "ant-from-file"
+    assert os.environ["ALREADY_SET"] == "real-env-value"  # env wins over file

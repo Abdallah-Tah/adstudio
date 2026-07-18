@@ -5,11 +5,15 @@ from typing import Annotated, Literal, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import auth, db
+from app import auth, db, settings_store
 from app.compiler.gpt_image import compile_image_prompt
+
+# Load provider keys from .env into the environment before anything reads them.
+settings_store.load_env()
 from app.pipeline import create_project
 from app.schema import Project, StoryboardApproval
 from app.snapshots import snapshot_project
@@ -174,7 +178,7 @@ async def describe(photos: list[UploadFile]) -> dict:
     payloads = [(await p.read(), p.content_type or "image/jpeg")
                 for p in photos[:describe_stage.MAX_PHOTOS]]
     try:
-        text, cost = describe_stage.run(payloads)
+        text, cost = await run_in_threadpool(describe_stage.run, payloads)
     except Exception as exc:
         raise HTTPException(502, f"could not describe photos: {exc}")
     return {"description": text, "cost_cents": cost}
@@ -201,7 +205,11 @@ async def post_project(
     )
     payloads = [(p.filename or "photo.jpg", await p.read()) for p in photos]
     try:
-        return enriched(create_project(session, storage, payloads, description, user))
+        # create_project is ~40-50s of blocking CPU (rembg) + network (4 LLM
+        # stages) for a multi-photo batch. Run it off the event loop so the
+        # single-worker server stays responsive and the connection isn't reset.
+        return await run_in_threadpool(
+            lambda: enriched(create_project(session, storage, payloads, description, user)))
     except StoryboardValidationError as exc:
         raise HTTPException(422, {
             "error_code": StoryboardValidationError.error_code,
