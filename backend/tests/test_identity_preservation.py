@@ -320,6 +320,18 @@ def test_qc_verdict_fails_on_frame_drift():
     assert clean.frame_drift is False and clean.passed is True
 
 
+def test_qc_verdict_fails_closed_when_notes_contradict_pass_flags():
+    contradictory = QCVerdict(
+        identity_ok=True,
+        artifacts=False,
+        frame_drift=False,
+        notes=("The product exhibits significant frame drift with morphing "
+               "and inconsistent rendering across keyframes."),
+    )
+    assert contradictory.notes_report_failure is True
+    assert contradictory.passed is False
+
+
 def test_video_qc_prompt_tracks_drift_and_anchor(monkeypatch):
     from app.stages import qc
 

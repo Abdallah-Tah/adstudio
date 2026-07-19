@@ -63,6 +63,7 @@ def _images_step(session, project: Project) -> str:
     """Queue missing images, auto-select QC-passed ones. Returns
     'ready' | 'waiting' | 'needs_review'."""
     waiting = False
+    queued_generation_ids: list[str] = []
     for scene_id in [s.scene_id for s in project.scenes]:
         row = session.get(db.ProjectRow, project.project_id)
         current = Project.model_validate(row.data)
@@ -100,9 +101,15 @@ def _images_step(session, project: Project) -> str:
             _set(project, "needs_review", str(exc))
             return "needs_review"
         if started.created:
-            image_worker.generate_scene_image.delay(
-                project.project_id, started.generation.generation_id)
+            # Commit every generation to the project ledger before a worker can
+            # consume any of them. Dispatching inside this loop lets a fast
+            # worker save an older JSON snapshot while later scenes are still
+            # being appended, erasing those generation IDs.
+            queued_generation_ids.append(started.generation.generation_id)
         waiting = True
+
+    for generation_id in queued_generation_ids:
+        image_worker.generate_scene_image.delay(project.project_id, generation_id)
 
     row = session.get(db.ProjectRow, project.project_id)
     final = Project.model_validate(row.data)
@@ -216,6 +223,36 @@ def tick(session, storage: Storage, project_id: str) -> str:
     job = production_readiness.active_job(project)
     if job is None:
         if project.production_job and project.production_job.status == "failed":
+            # A production poll can observe a scene before its final queued
+            # video completion has committed. Re-check the authoritative
+            # project state before telling the customer Auto-pilot failed.
+            # If all late completions are now selected, safely start a fresh
+            # idempotent production job instead of stranding a valid project.
+            if project.production_job.error_code == "VIDEO_ATTEMPTS_EXHAUSTED":
+                readiness = production_readiness.validate(project)
+                if readiness.ready:
+                    new_job = production_readiness.new_job(project)
+                    project.production_job = new_job
+                    _set(project, "producing",
+                         "All approved scene clips are ready. Resuming final production.")
+                    _save(session, project,
+                          f"autopilot recovered production {new_job.production_job_id}")
+                    produce_worker.produce_project.delay(project.project_id)
+                    return "producing"
+
+                retry_state = _video_retry_step(session, project)
+                if retry_state == "needs_review":
+                    _save(session, project, "autopilot needs review (video cap)")
+                    return "needs_review"
+                # A retry was queued after the failed poll. Give it a fresh
+                # production job to watch rather than leaving a terminal one.
+                new_job = production_readiness.new_job(project)
+                project.production_job = new_job
+                _set(project, "producing", "Retrying scene videos after quality review.")
+                _save(session, project,
+                      f"autopilot resumed video production {new_job.production_job_id}")
+                produce_worker.produce_project.delay(project.project_id)
+                return "producing"
             _set(project, "failed",
                  project.production_job.error_message or "Production failed.")
             _save(session, project, "autopilot failed (production)")

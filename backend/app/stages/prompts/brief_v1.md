@@ -11,6 +11,9 @@ Rules:
 - `tone` / `brand_voice`: short phrases, consistent with the product category.
 - `target_duration_s`: use the user's value if given, otherwise choose 20-35.
 - No trademarked third-party brand names.
+- If `reference_ad_dna` is supplied, use it only for transferable production
+  language (pacing, camera, palette, structure). Never copy the source ad's
+  branding, product claims, logo, or exact spoken copy.
 
 Product profile:
 

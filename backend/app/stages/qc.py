@@ -9,6 +9,7 @@ import base64
 import io
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -32,8 +33,35 @@ class QCVerdict(BaseModel):
     notes: str
 
     @property
+    def notes_report_failure(self) -> bool:
+        """Fail closed when a model's verdict fields contradict its notes."""
+        note = self.notes.lower()
+        negative = (
+            "no visible warping", "no warping", "no morphing", "no frame drift",
+            "without generation glitches", "no generation glitches",
+            "without glitches", "no visible glitches",
+        )
+        if any(phrase in note for phrase in negative):
+            return False
+        patterns = (
+            r"significant (?:frame )?drift",
+            r"(?:obvious|visible) (?:frame )?(?:drift|morphing|warping)",
+            r"(?:morphing|warping) artifacts?",
+            r"inconsistent rendering",
+            r"loss of product identity",
+            r"product identity (?:is )?inconsistent",
+            r"generation glitches? that compromise",
+        )
+        return any(re.search(pattern, note) for pattern in patterns)
+
+    @property
     def passed(self) -> bool:
-        return self.identity_ok and not self.artifacts and not self.frame_drift
+        return (
+            self.identity_ok
+            and not self.artifacts
+            and not self.frame_drift
+            and not self.notes_report_failure
+        )
 
 
 def qc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
@@ -133,7 +161,10 @@ def run_qc(
             + ("- caption_legible: are the burned-in captions readable?\n"
                if captions_burned else
                "- caption_legible: null (no captions in this clip).\n")
-            + "- notes: one or two sentences explaining your verdict."
+            + "- notes: one or two sentences explaining your verdict. The "
+            "booleans and notes must agree: if your notes mention morphing, "
+            "warping, a glitch, identity inconsistency, or frame drift, set "
+            "artifacts=true or frame_drift=true."
         ),
     }]
     for ref in refs:

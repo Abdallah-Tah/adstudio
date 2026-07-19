@@ -10,8 +10,13 @@ Follows the vendored freecut hard rules (vendor/VENDOR.md):
 Output: 1080×1920 H.264 MP4, 30 fps, AAC audio (VO placed per scene + licensed
 music ducked -12 dB under it).
 
-Uses /usr/bin/ffmpeg explicitly (the brew ffmpeg on this machine lacks libass).
+Discovers FFmpeg from the environment/PATH so the native macOS development
+setup works as well as Linux workers.  When the installed build does not have
+libass, production still completes without burned-in captions rather than
+failing after all scenes have passed QC.
 """
+import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -19,8 +24,16 @@ from pathlib import Path
 
 from app.schema import Scene
 
-FFMPEG = "/usr/bin/ffmpeg"
-FFPROBE = "/usr/bin/ffprobe"
+
+
+def _media_binary(name: str) -> str:
+    """Return an explicitly configured binary or the first one on PATH."""
+    configured = os.environ.get(f"ADSTUDIO_{name.upper()}_BIN")
+    return configured or shutil.which(name) or f"/usr/bin/{name}"
+
+
+FFMPEG = _media_binary("ffmpeg")
+FFPROBE = _media_binary("ffprobe")
 WIDTH, HEIGHT, FPS = 1080, 1920, 30
 MUSIC_DUCK_DB = -12.0
 
@@ -43,6 +56,22 @@ def _run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr[-2000:]}")
+
+
+def supports_ass_captions() -> bool:
+    """Whether this FFmpeg build can apply ASS subtitle files."""
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and any(
+        line.split()[1:2] == ["ass"] for line in proc.stdout.splitlines() if line.split()
+    )
 
 
 def probe_duration(path: Path) -> float:
@@ -268,8 +297,10 @@ def render(
 
         graph_parts: list[str] = []
         # captions LAST in the chain (hard rule) — after any video work
-        video_label = "[0:v]"
-        if vo_mp3 is not None and alignment is not None:
+        # Stream specifiers (e.g. ``0:v``) are mapped directly; bracketed
+        # labels are only valid for streams produced by a filter graph.
+        video_label = "0:v"
+        if vo_mp3 is not None and alignment is not None and supports_ass_captions():
             ass_path = work / "captions.ass"
             words = audio_stage.scene_words(alignment, ordered)
             scene_starts = {t.scene.scene_id: t.start_out for t in timed}

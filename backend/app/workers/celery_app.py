@@ -24,6 +24,7 @@ celery_app = Celery(
         "app.workers.images",
         "app.workers.videos",
         "app.workers.produce",
+        "app.workers.autopilot",
     ],
 )
 celery_app.conf.task_serializer = "json"

@@ -13,6 +13,29 @@ class AssetRef(BaseModel):
     created_at: str                           # ISO 8601
 
 
+class ReferenceAdDNA(BaseModel):
+    """The transferable creative language sampled from a reference ad.
+
+    This intentionally describes pacing and production choices, never copies
+    another advertiser's branding, product claims, spoken script, or logo.
+    """
+    format: str = "vertical 9:16"
+    pacing: str
+    visual_world: str
+    color_palette: list[str] = Field(default_factory=list)
+    camera_language: list[str] = Field(default_factory=list)
+    transition_language: str
+    shot_beats: list[str] = Field(default_factory=list, max_length=12)
+    copy_patterns: list[str] = Field(default_factory=list, max_length=5)
+    hook_options: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ReferenceAd(BaseModel):
+    asset: AssetRef
+    goal: str
+    dna: ReferenceAdDNA
+
+
 class ProductReference(BaseModel):
     asset_id: str
     reference_type: Literal[
@@ -273,6 +296,8 @@ class CreativeBrief(BaseModel):
     cta: str
     platform: Literal["tiktok"] = "tiktok"
     target_duration_s: float = Field(ge=10, le=60)
+    remake_goal: Optional[str] = None
+    reference_ad_dna: Optional[ReferenceAdDNA] = None
 
 
 class Strategy(BaseModel):
@@ -382,6 +407,7 @@ class Project(BaseModel):
     project_id: str
     created_at: str
     product: ProductProfile
+    reference_ad: Optional[ReferenceAd] = None
     brief: CreativeBrief
     strategy: Strategy
     scenes: list[Scene] = Field(min_length=3, max_length=12)

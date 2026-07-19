@@ -228,20 +228,33 @@ async def post_project(
     style: Annotated[Optional[str], Form()] = None,
     target_duration_s: Annotated[Optional[float], Form()] = None,
     mode: Annotated[Literal["manual", "auto"], Form()] = "manual",
+    remake_goal: Annotated[Optional[str], Form()] = None,
+    reference_video: Optional[UploadFile] = None,
 ) -> dict:
     if not photos:
         raise HTTPException(422, "at least one photo is required")
     user = UserInputs(
         audience=audience, offer=offer, cta=cta, tone=tone,
         style=style, target_duration_s=target_duration_s,
+        remake_goal=remake_goal,
     )
     payloads = [(p.filename or "photo.jpg", await p.read()) for p in photos]
+    reference_payload = None
+    if reference_video is not None:
+        content_type = reference_video.content_type or ""
+        if not content_type.startswith("video/"):
+            raise HTTPException(422, "reference ad must be a video file")
+        reference_payload = (
+            reference_video.filename or "reference-ad.mp4",
+            await reference_video.read(),
+        )
     try:
         # create_project is ~40-50s of blocking CPU (rembg) + network (4 LLM
         # stages) for a multi-photo batch. Run it off the event loop so the
         # single-worker server stays responsive and the connection isn't reset.
         project = await run_in_threadpool(
-            lambda: create_project(session, storage, payloads, description, user))
+            lambda: create_project(session, storage, payloads, description, user,
+                                   reference_video=reference_payload))
         if mode == "auto":
             await run_in_threadpool(
                 lambda: _start_autopilot(session, project.project_id))
@@ -497,6 +510,12 @@ def _start_autopilot(session: Session, project_id: str) -> Project:
         version = snapshot_project(session, project, actor="autopilot",
                                    reason="storyboard approved (auto mode)")
         project.storyboard_approval.approved_version_id = version.version_id
+    # Resume is an explicit request to try a failed final-production job
+    # again.  Terminal jobs are not active, but leaving one attached causes
+    # the auto-pilot to immediately repeat its old error instead of creating
+    # a fresh idempotent production run.
+    if project.production_job and project.production_job.status == "failed":
+        project.production_job = None
     project.automation.mode = "auto"
     project.automation.status = "generating_images"
     project.automation.detail = "Generating and quality-checking a still for every scene."

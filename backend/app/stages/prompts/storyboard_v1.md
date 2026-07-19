@@ -18,6 +18,9 @@ Per scene:
 - `caption_style`: bounce | highlight | plain.
 - `transition_out`: cut | fade | whip — whip only where the energy justifies it.
 - No trademarked third-party brand names.
+- When the strategy carries a reference-ad treatment, keep its pacing and
+  visual grammar while making every product action and claim specific to the
+  uploaded product.
 
 Style vocabulary ($style_id):
 

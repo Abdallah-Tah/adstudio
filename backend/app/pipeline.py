@@ -10,9 +10,11 @@ from sqlalchemy.orm import Session
 
 from app import product_references, segmentation
 from app.db import ProjectRow
-from app.schema import AssetRef, CostLedger, ProcessingWarning, ProductReference, Project
+from app.schema import (AssetRef, CostLedger, ProcessingWarning, ProductReference,
+                        Project, ReferenceAd)
 from app.snapshots import snapshot_state
-from app.stages import analysis, brief as brief_stage, storyboard, strategy as strategy_stage
+from app.stages import (analysis, brief as brief_stage, reference_ad,
+                        storyboard, strategy as strategy_stage)
 from app.stages.brief import UserInputs
 from app.storage import Storage
 
@@ -32,6 +34,7 @@ def create_project(
     description: str,
     user: UserInputs,
     actor: str = "user",
+    reference_video: tuple[str, bytes] | None = None,
 ) -> Project:
     """Upload photos, run stages 1-4, snapshot after each, persist the Project."""
     project_id = f"prj_{uuid.uuid4().hex[:12]}"
@@ -109,6 +112,25 @@ def create_project(
     state["product"] = profile.model_dump(mode="json")
     snapshot_state(session, project_id, state, actor, "stage1:analysis")
 
+    source_ad: ReferenceAd | None = None
+    if reference_video is not None:
+        filename, raw = reference_video
+        video_id = f"ast_{uuid.uuid4().hex[:12]}"
+        video_asset = AssetRef(
+            asset_id=video_id, kind="video",
+            uri=storage.put_bytes(raw, f"{project_id}/references/{video_id}",
+                                  guess_mime(filename)),
+            created_at=_now(),
+        )
+        goal = user.remake_goal or "Create an original, high-converting product ad."
+        dna, c = reference_ad.run(raw, filename, goal)
+        cost.analysis += c
+        source_ad = ReferenceAd(asset=video_asset, goal=goal, dna=dna)
+        user = user.model_copy(update={"reference_ad_dna": dna})
+        state["reference_ad"] = source_ad.model_dump(mode="json")
+        state["user_inputs"] = user.model_dump(exclude_none=True)
+        snapshot_state(session, project_id, state, actor, "stage1b:reference-ad")
+
     # Stage 2 — brief
     brief, c = brief_stage.run(profile, user)
     cost.strategy += c
@@ -138,6 +160,7 @@ def create_project(
         project_id=project_id,
         created_at=_now(),
         product=profile,
+        reference_ad=source_ad,
         brief=brief,
         strategy=strategy,
         scenes=scenes,

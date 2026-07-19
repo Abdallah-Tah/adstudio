@@ -8,7 +8,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from app.providers.openai_client import structured_call
-from app.schema import CreativeBrief, ProductProfile
+from app.schema import CreativeBrief, ProductProfile, ReferenceAdDNA
 from app.stages.prompt_loader import load_prompt
 
 
@@ -20,6 +20,8 @@ class UserInputs(BaseModel):
     tone: Optional[str] = None
     target_duration_s: Optional[float] = None
     style: Optional[str] = None               # consumed by stage 3, carried here
+    remake_goal: Optional[str] = None
+    reference_ad_dna: Optional[ReferenceAdDNA] = None
 
 
 def run(profile: ProductProfile, user: UserInputs) -> tuple[CreativeBrief, int]:

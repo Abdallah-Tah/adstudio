@@ -121,6 +121,10 @@ type Project = {
   automation?: AutomationState;
   production_job: ProductionJob | null;
   cost: Record<string, number> & { total: number };
+  reference_ad?: {
+    goal: string;
+    dna: { hook_options: string[]; visual_world: string; pacing: string };
+  } | null;
 };
 
 const AUTOPILOT_ACTIVE = new Set(["generating_images", "checking_consistency", "producing"]);
@@ -315,6 +319,8 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   const [dragFrom, setDragFrom] = useState<number | null>(null);
   const [tab, setTab] = useState<(typeof TABS)[number][0]>("preview");
   const [menu, setMenu] = useState<{ x: number; y: number; idx: number } | null>(null);
+  const [showHookPack, setShowHookPack] = useState(false);
+  const [overrideSceneId, setOverrideSceneId] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     Promise.all([
@@ -415,11 +421,16 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
       setError("No QC-rejected video with an uploaded asset is available to override.");
       return;
     }
-    const typed = window.prompt(`Type this exact sentence to override product identity QC:\n\n${VIDEO_QC_OVERRIDE_ACK}`);
-    if (typed !== VIDEO_QC_OVERRIDE_ACK) {
-      setError("QC override cancelled. The acknowledgement sentence must match exactly.");
+    setOverrideSceneId(sceneId);
+  }
+  function confirmRejectedVideoOverride(sceneId: string) {
+    const candidate = latestRejectedVideo(sceneId);
+    if (!candidate) {
+      setOverrideSceneId(null);
+      setError("No QC-rejected video with an uploaded asset is available to override.");
       return;
     }
+    setOverrideSceneId(null);
     setReadinessOpen(false);
     return act(() => postJSON(
       `/projects/${pid}/scenes/${sceneId}/videos/${candidate.generation_id}/override-qc`,
@@ -487,6 +498,11 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           {project.strategy.hook}
         </p>
         <div className="ml-auto flex items-center gap-2">
+          {project.reference_ad?.dna.hook_options.length ? (
+            <Button size="sm" variant="outline" onClick={() => setShowHookPack((open) => !open)}>
+              <Icon name="copy" size={14} /> {showHookPack ? "Hide hooks" : "Hook pack"}
+            </Button>
+          ) : null}
           {!approved ? (
             <Button size="sm" variant="outline" onClick={() => act(() => postJSON(`/projects/${pid}/storyboard/approve`))}>
               <Icon name="check" size={14} /> Approve storyboard
@@ -521,6 +537,24 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           )}
         </div>
       </div>
+      {showHookPack && project.reference_ad && (
+        <div className="border-b border-line bg-accent-soft/20 px-4 py-3">
+          <div className="mb-2 flex items-center gap-2">
+            <Icon name="film" size={14} className="text-accent-2" />
+            <p className="text-xs font-medium">Reference-ad hook pack</p>
+            <span className="text-xs text-muted">{project.reference_ad.dna.pacing} · {project.reference_ad.dna.visual_world}</span>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {project.reference_ad.dna.hook_options.map((hook, index) => (
+              <button key={hook} type="button" onClick={() => navigator.clipboard.writeText(hook)}
+                className="rounded-lg border border-line bg-surface px-3 py-2 text-left text-xs text-ink-2 hover:border-accent"
+                title="Copy hook">
+                <span className="mr-1 text-muted">{index + 1}.</span>{hook}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {project.automation && (project.automation.mode === "auto" ||
         ["needs_review", "failed", "completed"].includes(project.automation.status)) &&
@@ -576,6 +610,12 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           onOpenScene={openScene}
           onRegenerateFailed={regenerateBlockedScenes}
           onOverrideScene={overrideRejectedVideo}
+        />
+      )}
+      {overrideSceneId && (
+        <QCOverrideModal
+          onClose={() => setOverrideSceneId(null)}
+          onConfirm={() => confirmRejectedVideoOverride(overrideSceneId)}
         />
       )}
 
@@ -1091,6 +1131,39 @@ function FinalRenderBar({ project }: { project: Project }) {
       <a href={assetUrl(project.project_id, project.final_render!.asset_id)} download>
         <Button size="sm" variant="accent"><Icon name="download" size={14} /> Download MP4</Button>
       </a>
+    </div>
+  );
+}
+
+function QCOverrideModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  const [typed, setTyped] = useState("");
+  const matches = typed === VIDEO_QC_OVERRIDE_ACK;
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-labelledby="qc-override-title">
+      <div className="w-full max-w-lg rounded-xl border border-warn/40 bg-surface p-5 shadow-xl">
+        <div className="flex items-start gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-warn-soft text-warn">
+            <Icon name="alertTriangle" size={18} />
+          </span>
+          <div>
+            <h2 id="qc-override-title" className="text-h3">Override product identity QC</h2>
+            <p className="mt-1 text-sm text-muted">This video did not fully match the uploaded product. Only continue if you accept that risk.</p>
+          </div>
+        </div>
+        <label className="mt-4 block">
+          <span className="mb-1.5 block text-xs font-medium text-ink">Type this exact acknowledgement</span>
+          <code className="block rounded-md bg-surface-2 p-2 text-xs text-ink-2">{VIDEO_QC_OVERRIDE_ACK}</code>
+          <textarea value={typed} onChange={(e) => setTyped(e.target.value)} rows={3}
+            className="focus-ring mt-2 w-full rounded-lg border border-line bg-surface p-2 text-sm"
+            placeholder="Type the acknowledgement exactly" autoFocus />
+        </label>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button size="sm" variant="outline" onClick={onClose}>Cancel</Button>
+          <Button size="sm" variant="warn" disabled={!matches} onClick={onConfirm}>
+            Override QC
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
