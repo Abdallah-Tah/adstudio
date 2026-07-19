@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field, model_validator
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
+
+ProductLockMode = Literal["STRICT", "HYBRID", "REFERENCE_ONLY"]
 
 
 class AssetRef(BaseModel):
@@ -9,6 +11,85 @@ class AssetRef(BaseModel):
     generated_from: Optional[str] = None      # scene_id
     reference_assets: list[str] = Field(default_factory=list)  # asset_ids conditioned in
     created_at: str                           # ISO 8601
+
+
+class ProductReference(BaseModel):
+    asset_id: str
+    reference_type: Literal[
+        "front", "side", "back", "angle", "hero", "cutout",
+        "label_closeup", "detail_closeup", "original",
+    ]
+    quality_score: float = Field(ge=0.0, le=1.0)
+    is_primary: bool = False
+    alpha_coverage: Optional[float] = None
+    width: int
+    height: int
+
+
+class ProductIdentityProfile(BaseModel):
+    silhouette: str = ""
+    primary_shape: str = ""
+    proportions: str = ""
+    primary_colors: list[str] = Field(default_factory=list)
+    materials: list[str] = Field(default_factory=list)
+    transparent_components: list[str] = Field(default_factory=list)
+    button_count: Optional[int] = None
+    button_locations: list[str] = Field(default_factory=list)
+    ports: list[str] = Field(default_factory=list)
+    display_details: list[str] = Field(default_factory=list)
+    logo_location: Optional[str] = None
+    label_layout: Optional[str] = None
+    attachments: list[str] = Field(default_factory=list)
+    distinctive_features: list[str] = Field(default_factory=list)
+    forbidden_changes: list[str] = Field(default_factory=list)
+
+
+class ProductIdentityLock(BaseModel):
+    shape: str = ""
+    silhouette: str = ""
+    materials: list[str] = Field(default_factory=list)
+    colors: list[str] = Field(default_factory=list)
+    dimensions: str = ""
+    attachment_geometry: list[str] = Field(default_factory=list)
+    logo_position: Optional[str] = None
+    display: list[str] = Field(default_factory=list)
+    buttons: list[str] = Field(default_factory=list)
+    transparent_parts: list[str] = Field(default_factory=list)
+    accessories: list[str] = Field(default_factory=list)
+    forbidden_changes: list[str] = Field(default_factory=list)
+
+
+class ProductIdentityQC(BaseModel):
+    identity_score: float = Field(ge=0.0, le=1.0)
+    silhouette_match: bool
+    proportions_match: bool
+    colors_match: bool
+    materials_match: bool
+    logo_match: Optional[bool] = None
+    label_match: Optional[bool] = None
+    buttons_match: Optional[bool] = None
+    chamber_match: Optional[bool] = None
+    attachments_match: Optional[bool] = None
+    invented_parts: list[str] = Field(default_factory=list)
+    missing_parts: list[str] = Field(default_factory=list)
+    severe_failure: bool = False
+    notes: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return (
+            self.identity_score >= 0.82
+            and not self.severe_failure
+            and not self.invented_parts
+            and not self.missing_parts
+        )
+
+
+class QCOverride(BaseModel):
+    overridden_by: str
+    overridden_at: str
+    reason: str = ""
+    acknowledgement: str
 
 
 class Generation(BaseModel):
@@ -23,15 +104,52 @@ class Generation(BaseModel):
     prompt_hash: str                          # sha256 of compiled prompt
     seed: Optional[int] = None
     reference_assets: list[str] = Field(default_factory=list)
-    status: Literal["queued", "running", "succeeded",
-                    "failed", "qc_rejected"] = "queued"
+    reference_types: list[str] = Field(default_factory=list)
+    source_generation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    generation_mode: Optional[
+        Literal["reference_generation", "composite_exact_product", "hybrid"]
+    ] = None
+    status: Literal[
+        "queued", "submitting", "provider_queued", "provider_processing",
+        "downloading", "uploading", "qc_running", "running", "succeeded",
+        "retrying", "failed", "timed_out", "cancelled", "qc_rejected",
+    ] = "queued"
     qc_notes: Optional[str] = None
+    identity_qc: Optional[ProductIdentityQC] = None
+    qc_override: Optional[QCOverride] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
     cost_cents: int = 0
     asset: Optional[AssetRef] = None
     created_at: str
+    queued_at: Optional[str] = None
     # Set when the worker transitions the job to "running"; used by the watchdog
     # to time out jobs whose worker died or hung (see app.workers.reaper).
     started_at: Optional[str] = None
+    provider_called_at: Optional[str] = None
+    provider_completed_at: Optional[str] = None
+    provider_job_id: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_progress: Optional[float] = None
+    provider_submitted_at: Optional[str] = None
+    provider_started_at: Optional[str] = None
+    last_provider_check_at: Optional[str] = None
+    next_provider_check_at: Optional[str] = None
+    provider_status_url: Optional[str] = None
+    provider_response_url: Optional[str] = None
+    provider_cancel_url: Optional[str] = None
+    provider_result: Optional[dict[str, Any]] = None
+    last_heartbeat_at: Optional[str] = None
+    asset_uploaded_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    attempt_number: int = 1
+    queue_wait_ms: Optional[int] = None
+    provider_latency_ms: Optional[int] = None
+    download_latency_ms: Optional[int] = None
+    upload_latency_ms: Optional[int] = None
+    qc_latency_ms: Optional[int] = None
+    total_latency_ms: Optional[int] = None
 
 
 class ProcessingWarning(BaseModel):
@@ -42,6 +160,11 @@ class ProcessingWarning(BaseModel):
         "segmentation_low_coverage",
         "segmentation_high_coverage",
         "unsupported_image",
+        "reference_low_resolution",
+        "reference_extreme_crop",
+        "reference_small_product_coverage",
+        "reference_bad_transparency",
+        "reference_duplicate",
     ]
     asset_id: Optional[str] = None
     message: str
@@ -55,10 +178,52 @@ class ProductProfile(BaseModel):
     category: str
     colors: list[str]
     materials: list[str]
+    product_lock_mode: ProductLockMode = "STRICT"
     key_benefits: list[str] = Field(max_length=3)
     audience: str
     reference_images: list[AssetRef]
+    product_references: list[ProductReference] = Field(default_factory=list)
+    identity_profile: ProductIdentityProfile = Field(default_factory=ProductIdentityProfile)
+    identity_lock: ProductIdentityLock = Field(default_factory=ProductIdentityLock)
     processing_warnings: list[ProcessingWarning] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def populate_identity_lock(self) -> "ProductProfile":
+        if any([
+            self.identity_lock.shape,
+            self.identity_lock.silhouette,
+            self.identity_lock.materials,
+            self.identity_lock.colors,
+            self.identity_lock.dimensions,
+            self.identity_lock.attachment_geometry,
+            self.identity_lock.logo_position,
+            self.identity_lock.display,
+            self.identity_lock.buttons,
+            self.identity_lock.transparent_parts,
+            self.identity_lock.accessories,
+            self.identity_lock.forbidden_changes,
+        ]):
+            return self
+        identity = self.identity_profile
+        self.identity_lock = ProductIdentityLock(
+            shape=identity.primary_shape,
+            silhouette=identity.silhouette,
+            materials=identity.materials or self.materials,
+            colors=identity.primary_colors or self.colors,
+            dimensions=identity.proportions,
+            attachment_geometry=identity.attachments,
+            logo_position=identity.logo_location,
+            display=identity.display_details,
+            buttons=[
+                *([f"button count: {identity.button_count}"]
+                  if identity.button_count is not None else []),
+                *identity.button_locations,
+            ],
+            transparent_parts=identity.transparent_components,
+            accessories=identity.distinctive_features,
+            forbidden_changes=identity.forbidden_changes,
+        )
+        return self
 
 
 class CreativeBrief(BaseModel):
@@ -144,6 +309,37 @@ class MusicLicense(BaseModel):
     evidence_asset_id: Optional[str] = None
 
 
+class ProductionBlockingReason(BaseModel):
+    code: str
+    scene_id: Optional[str] = None
+    message: str
+
+
+class ProductionReadiness(BaseModel):
+    ready: bool
+    blocking_reasons: list[ProductionBlockingReason] = Field(default_factory=list)
+    scene_summary: dict[str, int]
+    estimated_video_cost_cents: int = 0
+    estimated_duration_s: float = 0
+
+
+class ProductionJob(BaseModel):
+    production_job_id: str
+    project_id: str
+    idempotency_key: str
+    status: Literal[
+        "preflight", "queued", "generating_videos", "generating_voiceover",
+        "selecting_music", "rendering", "qc_running", "completed", "failed",
+        "cancelled",
+    ] = "preflight"
+    current_scene_id: Optional[str] = None
+    progress_percent: float = Field(default=0, ge=0, le=100)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 class Project(BaseModel):
     schema_version: Literal["3.0"] = "3.0"
     project_id: str
@@ -157,6 +353,7 @@ class Project(BaseModel):
     music: Optional[AssetRef] = None
     music_license: Optional[MusicLicense] = None
     final_render: Optional[AssetRef] = None
+    production_job: Optional[ProductionJob] = None
     cost: CostLedger = Field(default_factory=CostLedger)
 
     @model_validator(mode="after")

@@ -24,6 +24,7 @@ def make_alignment(text: str, spc: float = 0.02) -> dict:
 def _all_images_selected(client, eager_worker, good_provider) -> str:
     project = create_test_project(client)
     pid = project["project_id"]
+    client.post(f"/projects/{pid}/storyboard/approve")
     for s in project["scenes"]:
         gid = client.post(
             f"/projects/{pid}/scenes/{s['scene_id']}/generate-image"
@@ -38,9 +39,13 @@ def test_produce_refuses_without_approved_images(client, monkeypatch):
     for k in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
         monkeypatch.setenv(k, "test")
     project = create_test_project(client)
+    client.post(f"/projects/{project['project_id']}/storyboard/approve")
     r = client.post(f"/projects/{project['project_id']}/produce")
-    assert r.status_code == 422
-    assert r.json()["detail"]["error_code"] == "SCENES_NOT_APPROVED"
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error_code"] == "PROJECT_NOT_READY"
+    assert any(b["code"] == "SCENE_MISSING_SELECTED_IMAGE"
+               for b in detail["blocking_reasons"])
 
 
 @respx.mock
@@ -52,7 +57,176 @@ def test_produce_requires_all_provider_keys(client, eager_worker,
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     r = client.post(f"/projects/{pid}/produce")
     assert r.status_code == 409
-    assert r.json()["detail"]["error_code"] == "PROVIDER_NOT_CONFIGURED"
+    detail = r.json()["detail"]
+    assert detail["error_code"] == "PROJECT_NOT_READY"
+    assert any("ELEVENLABS_API_KEY" in b["message"]
+               for b in detail["blocking_reasons"])
+
+
+@respx.mock
+def test_production_readiness_reports_qc_failed_scenes(
+        client, sqlite_session, eager_worker, good_provider, monkeypatch):
+    for k in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
+        monkeypatch.setenv(k, "test")
+    pid = _all_images_selected(client, eager_worker, good_provider)
+    doc = client.get(f"/projects/{pid}").json()
+    scene_ids = [doc["scenes"][0]["scene_id"], doc["scenes"][4]["scene_id"]]
+
+    # Simulate rejected video attempts in the two scenes from the reported UI.
+    from app import db
+    from app.schema import AssetRef, Generation
+
+    project_row = sqlite_session.get(db.ProjectRow, pid)
+    project = Project.model_validate(project_row.data)
+    for sid in scene_ids:
+        scene = next(s for s in project.scenes if s.scene_id == sid)
+        scene.generations.append(Generation(
+            generation_id=f"gen_reject_{sid[-4:]}",
+            scene_id=sid,
+            kind="video",
+            provider="fal",
+            model="fal-ai/kling-video/v3/standard/image-to-video",
+            prompt="p",
+            prompt_hash="h",
+            source_generation_id=scene.selected_image,
+            provider_job_id=f"req_{sid[-4:]}",
+            status="qc_rejected",
+            error_code="QC_REJECTED",
+            error_message="product identity QC failed",
+            qc_notes="product identity QC failed",
+            cost_cents=43,
+            created_at="2026-07-14T00:00:00Z",
+        ))
+    project_row.data = project.model_dump(mode="json")
+    sqlite_session.commit()
+
+    readiness = client.get(f"/projects/{pid}/production-readiness").json()
+    assert readiness["ready"] is False
+    blockers = [b for b in readiness["blocking_reasons"]
+                if b["code"] == "SCENE_QC_FAILED"]
+    assert {b["scene_id"] for b in blockers} == set(scene_ids)
+    assert readiness["scene_summary"] == {"total": 5, "ready": 3, "blocked": 2}
+
+
+@respx.mock
+def test_production_readiness_reports_video_attempts_exhausted(
+        client, sqlite_session, eager_worker, good_provider, monkeypatch):
+    for k in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
+        monkeypatch.setenv(k, "test")
+    pid = _all_images_selected(client, eager_worker, good_provider)
+    doc = client.get(f"/projects/{pid}").json()
+    scene_id = doc["scenes"][4]["scene_id"]
+
+    from app import db
+    from app.schema import AssetRef, Generation
+
+    project_row = sqlite_session.get(db.ProjectRow, pid)
+    project = Project.model_validate(project_row.data)
+    scene = next(s for s in project.scenes if s.scene_id == scene_id)
+    for i in range(3):
+        scene.generations.append(Generation(
+            generation_id=f"gen_reject_{i}",
+            scene_id=scene_id,
+            kind="video",
+            provider="fal",
+            model="fal-ai/kling-video/v3/standard/image-to-video",
+            prompt="p",
+            prompt_hash=f"h{i}",
+            source_generation_id=scene.selected_image,
+            provider_job_id=f"req_{i}",
+            status="qc_rejected",
+            error_code="QC_REJECTED",
+            error_message="product identity QC failed",
+            qc_notes="product identity QC failed",
+            cost_cents=43,
+            asset=AssetRef(
+                asset_id=f"ast_reject_{i}",
+                kind="video",
+                uri=f"s3://bucket/video-{i}.mp4",
+                generated_from=scene_id,
+                created_at="2026-07-14T00:00:00Z",
+            ),
+            created_at="2026-07-14T00:00:00Z",
+        ))
+    project_row.data = project.model_dump(mode="json")
+    sqlite_session.commit()
+
+    readiness = client.get(f"/projects/{pid}/production-readiness").json()
+    blockers = [b for b in readiness["blocking_reasons"]
+                if b["scene_id"] == scene_id]
+    assert [b["code"] for b in blockers] == ["SCENE_VIDEO_ATTEMPTS_EXHAUSTED"]
+    assert "3/3 video attempts" in blockers[0]["message"]
+
+
+@respx.mock
+def test_video_qc_override_selects_rejected_video_and_clears_blocker(
+        client, sqlite_session, eager_worker, good_provider, monkeypatch):
+    for k in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
+        monkeypatch.setenv(k, "test")
+    pid = _all_images_selected(client, eager_worker, good_provider)
+    doc = client.get(f"/projects/{pid}").json()
+    scene_id = doc["scenes"][4]["scene_id"]
+
+    from app import db
+    from app.schema import AssetRef, Generation
+
+    project_row = sqlite_session.get(db.ProjectRow, pid)
+    project = Project.model_validate(project_row.data)
+    scene = next(s for s in project.scenes if s.scene_id == scene_id)
+    for i in range(3):
+        scene.generations.append(Generation(
+            generation_id=f"gen_reject_{i}",
+            scene_id=scene_id,
+            kind="video",
+            provider="fal",
+            model="fal-ai/kling-video/v3/standard/image-to-video",
+            prompt="p",
+            prompt_hash=f"h{i}",
+            source_generation_id=scene.selected_image,
+            provider_job_id=f"req_{i}",
+            status="qc_rejected",
+            error_code="QC_REJECTED",
+            error_message="product identity QC failed",
+            qc_notes="product identity QC failed",
+            cost_cents=43,
+            asset=AssetRef(
+                asset_id=f"ast_reject_{i}",
+                kind="video",
+                uri=f"s3://bucket/video-{i}.mp4",
+                generated_from=scene_id,
+                created_at="2026-07-14T00:00:00Z",
+            ),
+            created_at="2026-07-14T00:00:00Z",
+        ))
+    project_row.data = project.model_dump(mode="json")
+    sqlite_session.commit()
+
+    bad_ack = client.post(
+        f"/projects/{pid}/scenes/{scene_id}/videos/gen_reject_2/override-qc",
+        json={"acknowledgement": "yes", "reason": "accept"},
+    )
+    assert bad_ack.status_code == 422
+
+    ok = client.post(
+        f"/projects/{pid}/scenes/{scene_id}/videos/gen_reject_2/override-qc",
+        json={
+            "acknowledgement": "I understand this video may not accurately match the product.",
+            "reason": "client approved QC risk",
+        },
+    )
+    assert ok.status_code == 200
+    scene_doc = next(s for s in ok.json()["scenes"] if s["scene_id"] == scene_id)
+    assert scene_doc["selected_video"] == "gen_reject_2"
+    gen_doc = next(g for g in scene_doc["generations"]
+                   if g["generation_id"] == "gen_reject_2")
+    assert gen_doc["status"] == "succeeded"
+    assert gen_doc["qc_override"]["reason"] == "client approved QC risk"
+    assert gen_doc["error_code"] is None
+
+    readiness = client.get(f"/projects/{pid}/production-readiness").json()
+    blockers = [b for b in readiness["blocking_reasons"]
+                if b.get("scene_id") == scene_id]
+    assert blockers == []
 
 
 @respx.mock

@@ -1,6 +1,8 @@
 """FastAPI entry point. Phase 1: schema export, project creation, scene edits."""
+import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
@@ -9,13 +11,13 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import auth, db, settings_store
+from app import auth, db, production_readiness, settings_store
 from app.compiler.gpt_image import compile_image_prompt
 
 # Load provider keys from .env into the environment before anything reads them.
 settings_store.load_env()
 from app.pipeline import create_project
-from app.schema import Project, StoryboardApproval
+from app.schema import Project, QCOverride, StoryboardApproval
 from app.snapshots import snapshot_project
 from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
@@ -23,6 +25,9 @@ from app.storage import Storage
 from app.workers import images as image_worker
 from app.workers import produce as produce_worker
 from app.workers import videos as video_worker
+
+log = logging.getLogger("adstudio.api")
+VIDEO_QC_OVERRIDE_ACK = "I understand this video may not accurately match the product."
 
 _session_factory = None
 
@@ -45,11 +50,18 @@ def get_storage() -> Storage:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    try:
+        video_worker.recover_active_video_generations.delay()
+    except Exception:
+        pass
     yield
 
 
 # Paths reachable without a session (login flow + liveness).
-_OPEN_PATHS = {"/health", "/schema", "/openapi.json", "/docs", "/redoc"}
+_OPEN_PATHS = {
+    "/health", "/schema", "/openapi.json", "/docs", "/redoc",
+    "/api/webhooks/fal", "/webhooks/fal",
+}
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "").lower() in ("1", "true", "yes")
 
 
@@ -244,12 +256,25 @@ def _listing_status(data: dict) -> str:
         return "video_ready"
     if all(s.get("selected_image") for s in scenes):
         return "images_ready"
-    if any(g["status"] in ("queued", "running")
+    if any(g["status"] in (
+        "queued", "submitting", "provider_queued", "provider_processing",
+        "downloading", "uploading", "qc_running", "running", "retrying",
+    )
            for s in scenes for g in s.get("generations", [])):
         return "running"
     if any(s.get("selected_image") for s in scenes):
         return "image_ready"
     return "storyboard"
+
+
+def _generation_in_project(project: Project, generation_id: str):
+    for scene in project.scenes:
+        for gen in scene.generations:
+            if gen.generation_id == generation_id:
+                return scene, gen
+    if project.voiceover and project.voiceover.generation_id == generation_id:
+        return None, project.voiceover
+    return None, None
 
 
 @app.get("/projects")
@@ -469,7 +494,7 @@ def generate_all_images(project_id: str, session: SessionDep) -> dict:
             skipped.append({"scene_id": scene.scene_id, "reason": "image selected"})
             continue
         try:
-            generation = image_worker.start_generation(session, current, scene.scene_id)
+            started = image_worker.start_generation(session, current, scene.scene_id)
         except image_worker.AttemptCapReached as exc:
             skipped.append({"scene_id": scene.scene_id, "reason": str(exc)})
             continue
@@ -478,9 +503,15 @@ def generate_all_images(project_id: str, session: SessionDep) -> dict:
                 "error_code": image_worker.ProviderNotConfigured.error_code,
                 "detail": str(exc),
             })
-        image_worker.generate_scene_image.delay(project_id, generation.generation_id)
-        queued.append({"scene_id": scene.scene_id,
-                       "generation_id": generation.generation_id})
+        if started.created:
+            image_worker.generate_scene_image.delay(
+                project_id, started.generation.generation_id)
+            queued.append({"scene_id": scene.scene_id,
+                           "generation_id": started.generation.generation_id})
+        else:
+            skipped.append({"scene_id": scene.scene_id,
+                            "generation_id": started.generation.generation_id,
+                            "reason": "generation already active"})
     return {"queued": queued, "skipped": skipped}
 
 
@@ -490,7 +521,7 @@ def generate_image(project_id: str, scene_id: str, session: SessionDep) -> dict:
     if not any(s.scene_id == scene_id for s in project.scenes):
         raise HTTPException(404, f"scene {scene_id} not found")
     try:
-        generation = image_worker.start_generation(session, project, scene_id)
+        started = image_worker.start_generation(session, project, scene_id)
     except image_worker.AttemptCapReached as exc:
         raise HTTPException(409, str(exc))
     except image_worker.ProviderNotConfigured as exc:
@@ -499,8 +530,67 @@ def generate_image(project_id: str, scene_id: str, session: SessionDep) -> dict:
             "error_code": image_worker.ProviderNotConfigured.error_code,
             "detail": str(exc),
         })
-    image_worker.generate_scene_image.delay(project_id, generation.generation_id)
-    return {"generation_id": generation.generation_id, "status": generation.status}
+    if started.created:
+        image_worker.generate_scene_image.delay(
+            project_id, started.generation.generation_id)
+    return {"generation_id": started.generation.generation_id,
+            "status": started.generation.status,
+            "duplicate": not started.created}
+
+
+@app.post("/projects/{project_id}/generations/{generation_id}/cancel")
+def cancel_generation(project_id: str, generation_id: str,
+                      session: SessionDep) -> dict:
+    from datetime import datetime, timezone
+
+    from app.providers import fal_client
+
+    row, project = _load_project(session, project_id)
+    _, gen = _generation_in_project(project, generation_id)
+    if gen is None:
+        raise HTTPException(404, f"generation {generation_id} not found")
+    if gen.status not in (
+        "queued", "submitting", "provider_queued", "provider_processing",
+        "downloading", "uploading", "qc_running", "running", "retrying",
+    ):
+        raise HTTPException(409, f"generation is already {gen.status}")
+    if gen.kind == "video" and gen.provider_cancel_url:
+        try:
+            result = fal_client.cancel(gen.provider_cancel_url)
+            gen.provider_status = result.get("status", gen.provider_status)
+        except Exception:
+            gen.provider_status = gen.provider_status or "CANCEL_REQUEST_FAILED"
+    gen.status = "cancelled"
+    gen.error_code = "CANCELLED"
+    gen.error_message = "cancelled by user"
+    gen.qc_notes = "cancelled by user"
+    gen.finished_at = datetime.now(timezone.utc).isoformat()
+    row.data = project.model_dump(mode="json")
+    gen_row = session.get(db.GenerationRow, generation_id)
+    if gen_row is not None:
+        gen_row.data = gen.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"cancel generation {generation_id}")
+    session.commit()
+    return enriched(project)
+
+
+@app.post("/api/projects/{project_id}/scenes/{scene_id}/generations/{generation_id}/cancel")
+@app.post("/projects/{project_id}/scenes/{scene_id}/generations/{generation_id}/cancel")
+def cancel_scene_generation(project_id: str, scene_id: str, generation_id: str,
+                            session: SessionDep) -> dict:
+    return cancel_generation(project_id, generation_id, session)
+
+
+@app.post("/projects/{project_id}/clear-stale-generations")
+def clear_stale_generations(project_id: str, session: SessionDep) -> dict:
+    from app.workers import reaper
+
+    _, project = _load_project(session, project_id)
+    changed = reaper.reap_stuck(session, project)
+    if changed:
+        _, project = _load_project(session, project_id)
+    return {"changed": changed, "project": enriched(project)}
 
 
 @app.post("/projects/{project_id}/scenes/{scene_id}/generate-video")
@@ -510,9 +600,13 @@ def generate_video(project_id: str, scene_id: str, session: SessionDep) -> dict:
     if not any(s.scene_id == scene_id for s in project.scenes):
         raise HTTPException(404, f"scene {scene_id} not found")
     try:
-        generation = video_worker.start_video_generation(session, project, scene_id)
+        started = video_worker.start_video_generation(session, project, scene_id)
     except video_worker.AttemptCapReached as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(409, {
+            "error_code": "VIDEO_ATTEMPTS_EXHAUSTED",
+            "scene_id": scene_id,
+            "detail": str(exc),
+        })
     except image_worker.ProviderNotConfigured as exc:
         raise HTTPException(409, {
             "error_code": image_worker.ProviderNotConfigured.error_code,
@@ -520,13 +614,22 @@ def generate_video(project_id: str, scene_id: str, session: SessionDep) -> dict:
         })
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    video_worker.generate_scene_video.delay(
-        project_id=project_id, generation_id=generation.generation_id)
-    return {"generation_id": generation.generation_id, "status": generation.status}
+    if started.created:
+        video_worker.generate_scene_video.delay(
+            project_id=project_id,
+            generation_id=started.generation.generation_id)
+    return {"generation_id": started.generation.generation_id,
+            "status": started.generation.status,
+            "duplicate": not started.created}
 
 
 class SelectImage(BaseModel):
     generation_id: str
+
+
+class OverrideQC(BaseModel):
+    acknowledgement: str = Field(min_length=10, max_length=300)
+    reason: str = Field(default="", max_length=500)
 
 
 @app.post("/projects/{project_id}/scenes/{scene_id}/select-image")
@@ -547,6 +650,48 @@ def select_image(project_id: str, scene_id: str, body: SelectImage,
     snapshot_project(session, project, actor="user",
                      reason=f"select image {body.generation_id} for {scene_id}")
     session.commit()
+    return enriched(project)
+
+
+@app.post("/projects/{project_id}/scenes/{scene_id}/videos/{generation_id}/override-qc")
+def override_video_qc(project_id: str, scene_id: str, generation_id: str,
+                      body: OverrideQC, session: SessionDep,
+                      actor: str = Depends(get_current_user)) -> dict:
+    row, project = _load_project(session, project_id)
+    scene = next((s for s in project.scenes if s.scene_id == scene_id), None)
+    if scene is None:
+        raise HTTPException(404, f"scene {scene_id} not found")
+    gen = next((g for g in scene.generations
+                if g.generation_id == generation_id and g.kind == "video"),
+               None)
+    if gen is None:
+        raise HTTPException(404, f"video generation {generation_id} not found")
+    if gen.status != "qc_rejected":
+        raise HTTPException(422, f"generation status is {gen.status!r}, not qc_rejected")
+    if gen.asset is None:
+        raise HTTPException(422, "cannot override QC for a video without an asset")
+    if body.acknowledgement.strip() != VIDEO_QC_OVERRIDE_ACK:
+        raise HTTPException(422, {
+            "error_code": "QC_OVERRIDE_ACK_REQUIRED",
+            "required_acknowledgement": VIDEO_QC_OVERRIDE_ACK,
+        })
+
+    gen.qc_override = QCOverride(
+        overridden_by=actor or "user",
+        overridden_at=datetime.now(timezone.utc).isoformat(),
+        reason=body.reason.strip(),
+        acknowledgement=body.acknowledgement.strip(),
+    )
+    gen.status = "succeeded"
+    gen.error_code = None
+    gen.error_message = None
+    scene.selected_video = gen.generation_id
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor=actor or "user",
+                     reason=f"override video QC {generation_id} for {scene_id}")
+    session.commit()
+    log.info("video QC overridden project=%s scene=%s generation=%s actor=%s",
+             project_id, scene_id, generation_id, actor or "user")
     return enriched(project)
 
 
@@ -572,24 +717,44 @@ def select_video(project_id: str, scene_id: str, body: SelectImage,
     return enriched(project)
 
 
+@app.get("/api/projects/{project_id}/production-readiness")
+@app.get("/projects/{project_id}/production-readiness")
+def production_readiness_endpoint(project_id: str, session: SessionDep) -> dict:
+    _, project = _load_project(session, project_id)
+    readiness = production_readiness.validate(project)
+    log.info(
+        "production preflight project=%s ready=%s blockers=%d estimated_video_cost_cents=%d",
+        project_id,
+        readiness.ready,
+        len(readiness.blocking_reasons),
+        readiness.estimated_video_cost_cents,
+    )
+    return readiness.model_dump(mode="json")
+
+
 @app.post("/projects/{project_id}/produce")
 def produce(project_id: str, session: SessionDep) -> dict:
-    """Run stages 6→9. Refuses unless every scene has a selected image."""
-    import os
-
-    _, project = _load_project(session, project_id)
-    missing = [s.scene_id for s in project.scenes if not s.selected_image]
-    if missing:
-        raise HTTPException(422, {
-            "error_code": "SCENES_NOT_APPROVED",
-            "detail": f"every scene needs an approved image first; missing: {missing}",
+    """Run stages 6→9. Backend readiness is the source of truth."""
+    row, project = _load_project(session, project_id)
+    active_job = production_readiness.active_job(project)
+    if active_job:
+        return {"status": "producing", "production_job": active_job.model_dump(mode="json")}
+    readiness = production_readiness.validate(project)
+    if not readiness.ready:
+        log.info("production blocked project=%s blockers=%s",
+                 project_id, [r.code for r in readiness.blocking_reasons])
+        raise HTTPException(409, {
+            "error_code": "PROJECT_NOT_READY",
+            **readiness.model_dump(mode="json"),
         })
-    for key in ("FAL_KEY", "ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"):
-        if not os.environ.get(key):
-            raise HTTPException(409, {
-                "error_code": "PROVIDER_NOT_CONFIGURED",
-                "detail": f"{key} is not configured",
-            })
+    job = production_readiness.new_job(project)
+    project.production_job = job
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"production queued {job.production_job_id}")
+    session.commit()
+    log.info("production queued project=%s production_job_id=%s estimated_video_cost_cents=%d",
+             project_id, job.production_job_id, readiness.estimated_video_cost_cents)
     queued = []
     for scene_id in [s.scene_id for s in project.scenes]:
         # reload each iteration: workers may have mutated the row in between
@@ -597,29 +762,44 @@ def produce(project_id: str, session: SessionDep) -> dict:
         scene = next(s for s in current.scenes if s.scene_id == scene_id)
         if scene.selected_video:
             continue
-        if any(g.kind == "video" and g.status in ("queued", "running")
+        if any(g.kind == "video" and g.status in (
+            "queued", "submitting", "provider_queued", "provider_processing",
+            "downloading", "uploading", "qc_running", "running", "retrying",
+        )
                for g in scene.generations):
             continue
         try:
-            generation = video_worker.start_video_generation(
+            started = video_worker.start_video_generation(
                 session, current, scene_id)
         except video_worker.AttemptCapReached as exc:
             raise HTTPException(409, str(exc))
-        video_worker.generate_scene_video.delay(
-            project_id=project_id, generation_id=generation.generation_id)
-        queued.append(generation.generation_id)
+        if started.created:
+            video_worker.generate_scene_video.delay(
+                project_id=project_id,
+                generation_id=started.generation.generation_id)
+        queued.append(started.generation.generation_id)
     produce_worker.produce_project.delay(project_id)
-    return {"status": "producing", "video_generations_queued": queued}
+    return {
+        "status": "producing",
+        "production_job": job.model_dump(mode="json"),
+        "video_generations_queued": queued,
+    }
 
 
 @app.get("/projects/{project_id}/status")
 def produce_status(project_id: str, session: SessionDep) -> dict:
     """Per-scene statuses + current pipeline stage for the progress UI."""
+    from app.workers import reaper
     _, project = _load_project(session, project_id)
+    if reaper.reap_stuck(session, project):
+        _, project = _load_project(session, project_id)
     scenes = []
     any_video_activity = False
     for s in sorted(project.scenes, key=lambda x: x.order):
-        active = [g for g in s.generations if g.status in ("queued", "running")]
+        active = [g for g in s.generations if g.status in (
+            "queued", "submitting", "provider_queued", "provider_processing",
+            "downloading", "uploading", "qc_running", "running", "retrying",
+        )]
         if any(g.kind == "video" for g in s.generations):
             any_video_activity = True
         scenes.append({
@@ -627,7 +807,15 @@ def produce_status(project_id: str, session: SessionDep) -> dict:
             "image_attempts": s.generation_attempts,
             "video_attempts": video_worker.video_attempts(s),
             "active": [{"generation_id": g.generation_id, "kind": g.kind,
-                        "status": g.status} for g in active],
+                        "status": g.status,
+                        "queued_at": g.queued_at or g.created_at,
+                        "started_at": g.started_at,
+                        "provider_job_id": g.provider_job_id,
+                        "provider_status": g.provider_status,
+                        "provider_progress": g.provider_progress,
+                        "last_heartbeat_at": g.last_heartbeat_at,
+                        "attempt_number": g.attempt_number,
+                        "error_code": g.error_code} for g in active],
         })
     if project.final_render:
         stage = "done"
@@ -641,9 +829,16 @@ def produce_status(project_id: str, session: SessionDep) -> dict:
         stage = "images"
     else:
         stage = "storyboard"
-    return {"stage": stage, "scenes": scenes,
-            "final_render_asset_id":
-                project.final_render.asset_id if project.final_render else None}
+    return {
+        "stage": stage,
+        "scenes": scenes,
+        "production_job": (
+            project.production_job.model_dump(mode="json")
+            if project.production_job else None
+        ),
+        "final_render_asset_id":
+            project.final_render.asset_id if project.final_render else None,
+    }
 
 
 @app.get("/projects/{project_id}/report")
@@ -717,8 +912,22 @@ def debug_jobs(session: SessionDep) -> dict:
         except ValueError:
             return None
 
-    STEP = {"queued": "waiting for worker", "running": "provider call in-flight",
-            "succeeded": "done", "failed": "failed", "qc_rejected": "QC rejected"}
+    STEP = {
+        "queued": "waiting for worker",
+        "submitting": "submitting to provider",
+        "provider_queued": "queued at provider",
+        "provider_processing": "provider processing",
+        "downloading": "downloading video",
+        "uploading": "uploading asset",
+        "qc_running": "running QC",
+        "running": "provider call in-flight",
+        "retrying": "waiting to retry",
+        "succeeded": "done",
+        "failed": "failed",
+        "timed_out": "timed out",
+        "cancelled": "cancelled",
+        "qc_rejected": "QC rejected",
+    }
 
     # attempt counts live on the scene, keyed for lookup
     attempts: dict[str, int] = {}
@@ -730,15 +939,40 @@ def debug_jobs(session: SessionDep) -> dict:
     jobs = []
     for r in session.query(db.GenerationRow).order_by(db.GenerationRow.generation_id).all():
         d = r.data
-        active = d.get("status") in ("queued", "running")
+        active = d.get("status") in (
+            "queued", "submitting", "provider_queued", "provider_processing",
+            "downloading", "uploading", "qc_running", "running", "retrying",
+        )
         jobs.append({
             "generation_id": r.generation_id, "project_id": r.project_id,
             "scene_id": r.scene_id, "kind": d.get("kind"), "status": d.get("status"),
             "provider": d.get("provider"), "model": d.get("model"),
             "attempts": attempts.get(r.generation_id),
-            "created_at": d.get("created_at"), "started_at": d.get("started_at"),
+            "created_at": d.get("created_at"),
+            "queued_at": d.get("queued_at") or d.get("created_at"),
+            "started_at": d.get("started_at"),
+            "provider_called_at": d.get("provider_called_at"),
+            "provider_completed_at": d.get("provider_completed_at"),
+            "provider_job_id": d.get("provider_job_id"),
+            "provider_status": d.get("provider_status"),
+            "provider_progress": d.get("provider_progress"),
+            "provider_submitted_at": d.get("provider_submitted_at"),
+            "last_provider_check_at": d.get("last_provider_check_at"),
+            "next_provider_check_at": d.get("next_provider_check_at"),
+            "last_heartbeat_at": d.get("last_heartbeat_at"),
+            "asset_uploaded_at": d.get("asset_uploaded_at"),
+            "finished_at": d.get("finished_at"),
             "elapsed_s": elapsed(d.get("started_at") or d.get("created_at")) if active else None,
             "current_step": STEP.get(d.get("status"), d.get("status")),
+            "attempt_number": d.get("attempt_number", 1),
+            "queue_wait_ms": d.get("queue_wait_ms"),
+            "provider_latency_ms": d.get("provider_latency_ms"),
+            "download_latency_ms": d.get("download_latency_ms"),
+            "upload_latency_ms": d.get("upload_latency_ms"),
+            "qc_latency_ms": d.get("qc_latency_ms"),
+            "total_latency_ms": d.get("total_latency_ms"),
+            "error_code": d.get("error_code"),
+            "sanitized_message": d.get("error_message") or d.get("qc_notes"),
             "cost_cents": d.get("cost_cents", 0),
             "note": d.get("qc_notes"),
         })
@@ -762,7 +996,10 @@ def debug_jobs(session: SessionDep) -> dict:
     try:
         import redis
         rc = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
-        queue_len = rc.llen("celery")
+        queue_len = {
+            "default": rc.llen("celery"),
+            "images": rc.llen("images"),
+        }
     except Exception:
         pass
 
@@ -770,14 +1007,48 @@ def debug_jobs(session: SessionDep) -> dict:
         "jobs": jobs,
         "counts": {
             "queued": sum(1 for j in jobs if j["status"] == "queued"),
+            "submitting": sum(1 for j in jobs if j["status"] == "submitting"),
+            "provider_queued": sum(1 for j in jobs if j["status"] == "provider_queued"),
+            "provider_processing": sum(1 for j in jobs if j["status"] == "provider_processing"),
+            "downloading": sum(1 for j in jobs if j["status"] == "downloading"),
+            "uploading": sum(1 for j in jobs if j["status"] == "uploading"),
+            "qc_running": sum(1 for j in jobs if j["status"] == "qc_running"),
             "running": sum(1 for j in jobs if j["status"] == "running"),
+            "retrying": sum(1 for j in jobs if j["status"] == "retrying"),
             "failed": sum(1 for j in jobs if j["status"] == "failed"),
+            "timed_out": sum(1 for j in jobs if j["status"] == "timed_out"),
+            "cancelled": sum(1 for j in jobs if j["status"] == "cancelled"),
             "succeeded": sum(1 for j in jobs if j["status"] == "succeeded"),
         },
         "worker": workers,
         "queue_length": queue_len,
         "watchdog": {"run_timeouts_s": reaper.RUN_TIMEOUTS, "queue_timeout_s": reaper.QUEUE_TIMEOUT},
     }
+
+
+@app.post("/api/webhooks/fal")
+@app.post("/webhooks/fal")
+async def fal_webhook(request: Request, session: SessionDep) -> dict:
+    """fal queue completion callback.
+
+    The handler only persists provider state and enqueues finalization so fal
+    gets a quick 200. Duplicate callbacks are idempotent.
+    """
+    import json
+
+    from app import generation_config
+
+    raw = await request.body()
+    if generation_config.FAL_WEBHOOK_VERIFY:
+        raise HTTPException(501, {
+            "error_code": "WEBHOOK_VERIFICATION_NOT_CONFIGURED",
+            "detail": "fal ED25519 verification requires a crypto dependency",
+        })
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON webhook payload")
+    return video_worker.handle_fal_webhook(session, payload)
 
 
 @app.get("/projects/{project_id}/assets/{asset_id}")

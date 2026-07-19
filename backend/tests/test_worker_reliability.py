@@ -25,6 +25,17 @@ def _gen(status: str, *, created: float = 10, started: float | None = None) -> G
     )
 
 
+def _video_gen(status: str, *, submitted: float = 10,
+               heartbeat: float = 10) -> Generation:
+    return Generation(
+        generation_id="gen_v", scene_id="scn_v", kind="video",
+        provider="fal", model="m", prompt="p", prompt_hash="h",
+        status=status, created_at=_iso(submitted),
+        provider_submitted_at=_iso(submitted),
+        last_heartbeat_at=_iso(heartbeat),
+    )
+
+
 # ---- the actual bug: tasks must register --------------------------------
 
 def test_task_modules_are_registered():
@@ -42,6 +53,12 @@ def test_task_time_limits_configured():
     from app.workers.celery_app import celery_app
     assert celery_app.conf.task_soft_time_limit
     assert celery_app.conf.task_time_limit > celery_app.conf.task_soft_time_limit
+    assert celery_app.conf.task_acks_late is True
+    assert celery_app.conf.task_reject_on_worker_lost is True
+    assert celery_app.conf.worker_prefetch_multiplier == 1
+    assert celery_app.conf.task_routes["app.workers.images.generate_scene_image"] == {
+        "queue": "images"
+    }
 
 
 # ---- watchdog / reaper --------------------------------------------------
@@ -57,11 +74,21 @@ def test_queued_backlog_is_not_reaped():
     assert reaper._overdue(_gen("queued", created=120)) is None
 
 def test_queued_job_with_no_worker_times_out():
-    assert reaper._overdue(_gen("queued", created=1000)) is not None   # > 900
+    assert reaper._overdue(_gen("queued", created=301)) is not None   # > 300
 
 def test_terminal_jobs_are_never_reaped():
-    for st in ("succeeded", "failed", "qc_rejected"):
+    for st in ("succeeded", "failed", "timed_out", "cancelled", "qc_rejected"):
         assert reaper._overdue(_gen(st, created=99999)) is None
+
+def test_provider_video_with_fresh_heartbeat_is_not_reaped():
+    assert reaper._overdue(
+        _video_gen("provider_processing", submitted=400, heartbeat=30)
+    ) is None
+
+def test_provider_video_stale_heartbeat_times_out():
+    assert reaper._overdue(
+        _video_gen("provider_processing", submitted=400, heartbeat=240)
+    ) is not None
 
 
 # ---- provider timeout / failure surfacing -------------------------------
@@ -87,7 +114,27 @@ def test_soft_time_limit_marks_failed(client, eager_worker, monkeypatch):
     gen = next(g for s in proj["scenes"] for g in s["generations"]
                if g["generation_id"] == gid)
     assert gen["status"] == "failed"
-    assert "timed out" in (gen["qc_notes"] or "")
+    assert gen["error_code"] == "PROVIDER_TIMEOUT"
+    assert "timeout" in (gen["qc_notes"] or "")
+
+
+def test_failure_classification_separates_transient_and_permanent():
+    from app.workers.images import classify_failure
+
+    class RateLimit(Exception):
+        status_code = 429
+
+    class BadRequest(Exception):
+        status_code = 400
+
+    class ServerError(Exception):
+        status_code = 503
+
+    assert classify_failure(RateLimit("try later")).transient is True
+    assert classify_failure(ServerError("unavailable")).transient is True
+    bad = classify_failure(BadRequest("malformed reference image"))
+    assert bad.transient is False
+    assert bad.error_code == "INVALID_REFERENCE_IMAGE"
 
 
 # ---- diagnostics endpoint ----------------------------------------------

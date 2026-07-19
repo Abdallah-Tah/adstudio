@@ -29,7 +29,8 @@ GENERATE_AUDIO = False           # hard-off for v0.1
 MIN_BILLED_S, MAX_BILLED_S = 3, 15
 NEGATIVE_PROMPT = (
     "blur, distortion, low quality, morphing product, product changing shape, "
-    "extra parts appearing, text, captions, watermark, logo"
+    "extra parts appearing, missing product parts, logo drift, label drift, "
+    "warped hands, flicker, text, captions, watermark"
 )
 
 CAPABILITIES = EngineCapabilities(
@@ -64,14 +65,21 @@ def compile_video_prompt(scene: Scene, style_id: str) -> CompiledVideoPrompt:
     never re-describes the product (same delta discipline as images)."""
     style = STYLES[style_id]
     prompt = (
-        "Animate this exact scene. The product must stay exactly as shown in "
-        "the start frame — same shape, colors, materials, markings.\n"
-        f"Action: {scene.action}\n"
-        f"Camera: {scene.camera}\n"
-        f"Lighting: {scene.lighting}\n"
+        "Animate the supplied start image.\n\n"
+        "The start image is the source of truth for a real uploaded commercial product. "
+        "Do not infer, reimagine, or replace the product from the text prompt.\n\n"
+        "Preserve the exact product for the entire clip, including body shape, "
+        "proportions, attachment geometry, transparent components, buttons, "
+        "display, ports, colors, materials, logo, and label placement when visible.\n\n"
+        "Motion only:\n"
+        f"- Action: {scene.action}\n"
+        f"- Camera: {scene.camera}\n"
+        f"- Lighting: {scene.lighting}\n"
+        "- Use subtle camera movement, realistic hand movement, and natural environmental motion.\n"
         f"Motion style: {style['motion']}\n"
-        "Vertical 9:16. Smooth, realistic motion. No text, no logos, no people's "
-        "faces in focus."
+        "Do not redesign, morph, bend, enlarge, shrink, replace, add, or remove product parts. "
+        "Avoid large rotations or aggressive transformations. Vertical 9:16. "
+        "No text, captions, watermarks, or people's faces in focus."
     )
     if scene.selected_image is None:
         raise ValueError(f"scene {scene.scene_id} has no selected image")

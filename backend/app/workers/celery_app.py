@@ -37,6 +37,12 @@ celery_app.conf.accept_content = ["json"]
 # job is marked failed); time_limit is the hard SIGKILL backstop.
 celery_app.conf.task_soft_time_limit = 120
 celery_app.conf.task_time_limit = 150
+celery_app.conf.task_acks_late = True
+celery_app.conf.task_reject_on_worker_lost = True
+celery_app.conf.worker_prefetch_multiplier = 1
+celery_app.conf.task_routes = {
+    "app.workers.images.generate_scene_image": {"queue": "images"},
+}
 
 # The worker imports the `include` modules during boot (import_default_modules),
 # which registers their @task decorators — that's what fixes the empty [tasks]

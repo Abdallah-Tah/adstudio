@@ -33,14 +33,28 @@ def _save(session, project: Project, reason: str) -> None:
     snapshot_project(session, project, actor="worker", reason=reason)
 
 
+def _set_job(project: Project, status: str, progress: float,
+             *, error_code: str | None = None,
+             error_message: str | None = None) -> None:
+    if project.production_job is None:
+        return
+    project.production_job.status = status
+    project.production_job.progress_percent = progress
+    project.production_job.error_code = error_code
+    project.production_job.error_message = error_message
+    project.production_job.updated_at = _now()
+
+
 def readiness(project: Project) -> str:
     """'ready' | 'waiting' | 'stuck'."""
     waiting = False
     for scene in project.scenes:
         if scene.selected_video:
             continue
-        active = any(g.kind == "video" and g.status in ("queued", "running")
-                     for g in scene.generations)
+        active = any(g.kind == "video" and g.status in (
+            "queued", "submitting", "provider_queued", "provider_processing",
+            "downloading", "uploading", "qc_running", "running", "retrying",
+        ) for g in scene.generations)
         if active:
             waiting = True
         elif video_attempts(scene) >= MAX_ATTEMPTS:
@@ -55,6 +69,9 @@ def finalize(session, storage: Storage, project: Project) -> Project:
     ordered = sorted(project.scenes, key=lambda s: s.order)
 
     # ---- stage 8a: voiceover (one call, char timestamps) ----
+    _set_job(project, "generating_voiceover", 60)
+    _save(session, project, "produce:voiceover started")
+    session.commit()
     vo_mp3, alignment, vo_cost = audio_stage.synthesize(project.strategy.script)
     vo_asset_id = f"ast_{uuid.uuid4().hex[:12]}"
     vo_uri = storage.put_bytes(
@@ -77,6 +94,7 @@ def finalize(session, storage: Storage, project: Project) -> Project:
     session.commit()
 
     # ---- stage 8b: licensed music (library may legitimately be empty) ----
+    _set_job(project, "selecting_music", 70)
     music_mp3 = None
     tracks = music_stage.load_library(storage)
     total_s = sum(s.duration_s for s in ordered)
@@ -94,6 +112,9 @@ def finalize(session, storage: Storage, project: Project) -> Project:
         session.commit()
 
     # ---- stage 9: render + final QC ----
+    _set_job(project, "rendering", 82)
+    _save(session, project, "produce:rendering")
+    session.commit()
     clips: dict[str, bytes] = {}
     for scene in ordered:
         gen = next(g for g in scene.generations
@@ -101,6 +122,9 @@ def finalize(session, storage: Storage, project: Project) -> Project:
         clips[scene.scene_id] = storage.get_bytes(gen.asset.uri)
     final_mp4 = render.render(ordered, clips, vo_mp3, alignment, music_mp3)
 
+    _set_job(project, "qc_running", 92)
+    _save(session, project, "produce:final qc")
+    session.commit()
     refs = [storage.get_bytes(a.uri)
             for a in project.product.reference_images[:qc.MAX_REFERENCES]]
     verdict, qc_cost = qc.run_qc(final_mp4, refs, ordered[0],
@@ -112,6 +136,7 @@ def finalize(session, storage: Storage, project: Project) -> Project:
         final_mp4, f"{project.project_id}/renders/{render_id}.mp4", "video/mp4")
     project.final_render = AssetRef(
         asset_id=render_id, kind="render", uri=uri, created_at=_now())
+    _set_job(project, "completed", 100)
     reason = ("produce:rendered" if verdict.passed
               else f"produce:rendered (final QC flagged: {verdict.notes})")
     _save(session, project, reason)
@@ -128,16 +153,33 @@ def produce_project(self, project_id: str) -> str:
         row = session.get(db.ProjectRow, project_id)
         project = Project.model_validate(row.data)
         if project.final_render is not None:
+            _set_job(project, "completed", 100)
+            _save(session, project, "produce:already rendered")
+            session.commit()
             return "done"          # idempotent
         state = readiness(project)
         if state == "stuck":
+            _set_job(project, "failed", 0,
+                     error_code="VIDEO_ATTEMPTS_EXHAUSTED",
+                     error_message="A scene exhausted its video attempts.")
             _save(session, project,
                   "produce:failed (a scene exhausted its video attempts)")
             session.commit()
             return "failed"
         if state == "waiting":
+            _set_job(project, "generating_videos", 35)
+            _save(session, project, "produce:waiting for videos")
+            session.commit()
             raise self.retry(countdown=POLL_SECONDS)
-        finalize(session, Storage(), project)
+        try:
+            finalize(session, Storage(), project)
+        except Exception as exc:
+            _set_job(project, "failed", 0,
+                     error_code="PRODUCTION_FAILED",
+                     error_message=str(exc).splitlines()[0][:240])
+            _save(session, project, "produce:failed")
+            session.commit()
+            return "failed"
         return "done"
     finally:
         session.close()

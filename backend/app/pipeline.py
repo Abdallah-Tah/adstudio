@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app import segmentation
+from app import product_references, segmentation
 from app.db import ProjectRow
-from app.schema import AssetRef, CostLedger, ProcessingWarning, Project
+from app.schema import AssetRef, CostLedger, ProcessingWarning, ProductReference, Project
 from app.snapshots import snapshot_state
 from app.stages import analysis, brief as brief_stage, storyboard, strategy as strategy_stage
 from app.stages.brief import UserInputs
@@ -39,14 +39,30 @@ def create_project(
     # Upload originals + rembg cutouts as reference assets.
     storage.ensure_bucket()
     refs: list[AssetRef] = []
+    product_refs: list[ProductReference] = []
     photo_payloads: list[tuple[bytes, str]] = []
     warnings: list[ProcessingWarning] = []
-    for filename, raw in photos:
+    seen_hashes: set[str] = set()
+    for index, (filename, raw) in enumerate(photos):
         mime = guess_mime(filename)
         asset_id = f"ast_{uuid.uuid4().hex[:12]}"
         uri = storage.put_bytes(raw, f"{project_id}/uploads/{asset_id}", mime)
-        refs.append(AssetRef(asset_id=asset_id, kind="reference", uri=uri, created_at=_now()))
+        original = AssetRef(asset_id=asset_id, kind="reference", uri=uri, created_at=_now())
+        refs.append(original)
         photo_payloads.append((raw, mime))
+        warnings.extend(product_references.upload_warnings(
+            asset_id, raw, seen_hashes=seen_hashes))
+        seen_hashes.add(product_references.content_hash(raw))
+        try:
+            product_refs.append(product_references.make_original_reference(
+                asset_id, filename, raw, index))
+        except Exception:
+            warnings.append(ProcessingWarning(
+                code="unsupported_image",
+                asset_id=asset_id,
+                message="image could not be opened for reference metadata",
+                created_at=_now(),
+            ))
         cutout, warning = segmentation.segment(raw)
         if cutout is not None:
             cut_id = f"ast_{uuid.uuid4().hex[:12]}"
@@ -54,6 +70,26 @@ def create_project(
                 cutout, f"{project_id}/uploads/{cut_id}.png", "image/png")
             refs.append(AssetRef(asset_id=cut_id, kind="reference", uri=cut_uri,
                                  reference_assets=[asset_id], created_at=_now()))
+            try:
+                cut_ref = product_references.make_cutout_reference(
+                    cut_id, cutout, primary=False)
+                product_refs.append(cut_ref)
+                if cut_ref.alpha_coverage is not None and not (
+                    segmentation.ALPHA_MIN <= cut_ref.alpha_coverage <= segmentation.ALPHA_MAX
+                ):
+                    warnings.append(ProcessingWarning(
+                        code="reference_bad_transparency",
+                        asset_id=cut_id,
+                        message=f"cutout alpha coverage {cut_ref.alpha_coverage:.2f} is not usable as a primary reference",
+                        created_at=_now(),
+                    ))
+            except Exception:
+                warnings.append(ProcessingWarning(
+                    code="unsupported_image",
+                    asset_id=cut_id,
+                    message="cutout could not be opened for reference metadata",
+                    created_at=_now(),
+                ))
         elif warning is not None:
             # recoverable: the original stays a usable reference asset
             warnings.append(warning.model_copy(update={"asset_id": asset_id}))
@@ -64,6 +100,7 @@ def create_project(
 
     # Stage 1 — analysis
     profile, c = analysis.run(photo_payloads, description, refs)
+    profile.product_references = product_refs
     profile.processing_warnings = warnings
     cost.analysis += c
     state["product"] = profile.model_dump(mode="json")

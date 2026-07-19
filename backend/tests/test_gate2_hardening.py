@@ -82,10 +82,12 @@ def test_segmentation_warning_is_structured(client, monkeypatch):
                         lambda raw: (None, warning))
     project = create_test_project(client)
     warnings = project["product"]["processing_warnings"]
-    assert len(warnings) == 1
-    assert warnings[0]["code"] == "segmentation_low_coverage"
-    assert warnings[0]["recoverable"] is True
-    assert warnings[0]["asset_id"]  # linked to the uploaded original
+    segmentation_warnings = [
+        w for w in warnings if w["code"] == "segmentation_low_coverage"
+    ]
+    assert len(segmentation_warnings) == 1
+    assert segmentation_warnings[0]["recoverable"] is True
+    assert segmentation_warnings[0]["asset_id"]  # linked to the uploaded original
     # original photo is still a usable reference (cutout skipped)
     assert len(project["product"]["reference_images"]) == 1
 

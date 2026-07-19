@@ -4,7 +4,7 @@ import base64
 from pydantic import BaseModel, Field
 
 from app.providers.openai_client import structured_call
-from app.schema import AssetRef, ProductProfile
+from app.schema import AssetRef, ProductIdentityProfile, ProductProfile
 from app.stages.prompt_loader import load_prompt
 
 
@@ -17,6 +17,7 @@ class ProductFacts(BaseModel):
     materials: list[str]
     key_benefits: list[str] = Field(max_length=3)
     audience: str
+    identity_profile: ProductIdentityProfile = Field(default_factory=ProductIdentityProfile)
 
 
 def run(

@@ -7,6 +7,7 @@ type Variant =
   | "outline"
   | "subtle"
   | "success"
+  | "warn"
   | "destructive"
   | "ghost";
 type Size = "xs" | "sm" | "md" | "lg" | "icon" | "icon-sm";
@@ -28,6 +29,7 @@ export function Button({
     outline: "border border-line bg-surface hover:bg-surface-hover hover:border-line-strong",
     subtle: "bg-surface-hover text-ink-2 hover:bg-line/60",
     success: "bg-success text-white hover:brightness-110",
+    warn: "bg-warn text-white hover:brightness-110",
     destructive: "bg-danger text-white hover:brightness-110",
     ghost: "text-ink-2 hover:bg-surface-hover hover:text-ink",
   };

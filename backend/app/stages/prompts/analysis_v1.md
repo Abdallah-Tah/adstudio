@@ -11,6 +11,11 @@ Rules:
 - `colors` / `materials`: only what you can see or what the description states.
 - `key_benefits`: at most 3, each grounded in the photos or description.
 - `audience`: the most plausible buyer, one short phrase.
+- `identity_profile`: visible, verifiable physical identity only. Leave any
+  unsupported field empty/null. Capture silhouette, primary shape, proportions,
+  exact visible colors/materials, transparent components, button count and
+  locations, ports, display details, logo location, label layout, attachments,
+  distinctive features, and forbidden changes needed to prevent redesign.
 - Never include trademarked third-party brand names other than the product's own brand.
 
 Seller description:

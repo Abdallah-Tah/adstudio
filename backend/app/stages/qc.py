@@ -6,12 +6,14 @@ Structured output validated against QCVerdict (hard rule: never free-text).
 Spend is metered to CostLedger.qc.
 """
 import base64
+import io
 import math
 import os
 import tempfile
 from pathlib import Path
 from typing import Optional
 
+from PIL import Image
 from pydantic import BaseModel
 
 from app.pricing import ANTHROPIC_TOKEN_PRICES
@@ -63,6 +65,19 @@ def _image_block(data: bytes, media_type: str) -> dict:
     }
 
 
+def _media_type(data: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = (img.format or "").lower()
+    except Exception:
+        return "image/png"
+    if fmt in {"jpeg", "jpg"}:
+        return "image/jpeg"
+    if fmt == "webp":
+        return "image/webp"
+    return "image/png"
+
+
 def _client():
     import anthropic
 
@@ -105,7 +120,7 @@ def run_qc(
         ),
     }]
     for ref in refs:
-        content.append(_image_block(ref, "image/png"))
+        content.append(_image_block(ref, _media_type(ref)))
     for frame in keyframes:
         content.append(_image_block(frame, "image/jpeg"))
 

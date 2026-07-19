@@ -24,12 +24,21 @@ const TONES: Record<string, ToneDef> = {
   // in-progress (amber, animated dot)
   rendering: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
   queued: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
+  submitting: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
+  provider_queued: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
+  provider_processing: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
+  downloading: { cls: "bg-info-soft text-info", dot: "bg-info animate-pulse" },
+  uploading: { cls: "bg-info-soft text-info", dot: "bg-info animate-pulse" },
+  qc_running: { cls: "bg-info-soft text-info", dot: "bg-info animate-pulse" },
   running: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
+  retrying: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
   generating: { cls: "bg-warn-soft text-warn", dot: "bg-warn animate-pulse" },
   // warning (orange)
   stale: { cls: "bg-orange-500/12 text-orange-600 dark:text-orange-400", dot: "bg-orange-500" },
   // failure (red)
   failed: { cls: "bg-danger-soft text-danger", dot: "bg-danger" },
+  timed_out: { cls: "bg-danger-soft text-danger", dot: "bg-danger" },
+  cancelled: { cls: "bg-line/60 text-muted", dot: "bg-muted-2" },
   qc_rejected: { cls: "bg-danger-soft text-danger", dot: "bg-danger" },
   qc_failed: { cls: "bg-danger-soft text-danger", dot: "bg-danger" },
 };

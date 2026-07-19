@@ -107,6 +107,22 @@ def bad_provider(monkeypatch):
     monkeypatch.setattr(openai_images, "generate_image", boom)
 
 
+@pytest.fixture(autouse=True)
+def passing_image_identity_qc(monkeypatch):
+    from app.schema import ProductIdentityQC
+    from app.stages import image_identity_qc
+
+    verdict = ProductIdentityQC(
+        identity_score=0.95,
+        silhouette_match=True,
+        proportions_match=True,
+        colors_match=True,
+        materials_match=True,
+        notes="identity preserved",
+    )
+    monkeypatch.setattr(image_identity_qc, "run_qc", lambda *a, **k: (verdict, 0))
+
+
 @pytest.fixture
 def client(sqlite_session, fake_storage, monkeypatch):
     """TestClient wired to sqlite + fake storage; rembg stubbed out."""
