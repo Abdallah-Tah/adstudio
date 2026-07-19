@@ -123,6 +123,35 @@ def passing_image_identity_qc(monkeypatch):
     monkeypatch.setattr(image_identity_qc, "run_qc", lambda *a, **k: (verdict, 0))
 
 
+@pytest.fixture(autouse=True)
+def passing_scene_consistency(monkeypatch):
+    """Cross-scene identity check passes by default; override per-test to fail."""
+    from app.schema import SceneConsistencyReport, SceneConsistencyVerdict
+    from app.stages import scene_consistency
+
+    def fake_run_check(project, storage):
+        report = SceneConsistencyReport(
+            checked_at="2026-07-15T00:00:00+00:00",
+            fingerprint=scene_consistency.fingerprint(project),
+            consistent=True,
+            verdicts=[SceneConsistencyVerdict(scene_id=s.scene_id, consistent=True)
+                      for s in project.scenes],
+            cost_cents=0,
+        )
+        return report, 0
+    monkeypatch.setattr(scene_consistency, "run_check", fake_run_check)
+
+
+@pytest.fixture(autouse=True)
+def no_ai_precheck(monkeypatch):
+    """Upload pre-check's AI screen finds nothing by default (no network)."""
+    from app.stages import upload_precheck
+
+    monkeypatch.setattr(
+        upload_precheck, "ai_assess",
+        lambda photos: (upload_precheck._AIAssessment(findings=[]), 0))
+
+
 @pytest.fixture
 def client(sqlite_session, fake_storage, monkeypatch):
     """TestClient wired to sqlite + fake storage; rembg stubbed out."""

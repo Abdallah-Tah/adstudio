@@ -45,6 +45,7 @@ def test_task_modules_are_registered():
     celery_app.loader.import_default_modules()  # what the worker does on boot
     names = set(celery_app.tasks)
     assert "app.workers.images.generate_scene_image" in names
+    assert "app.workers.autopilot.run_autopilot" in names
     assert "app.workers.videos.generate_scene_video" in names
     assert "app.workers.produce.produce_project" in names
 

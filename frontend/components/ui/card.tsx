@@ -43,7 +43,7 @@ export function StatCard({
         <p className="text-overline">{label}</p>
         {icon && <span className={cn("opacity-80", accent)}>{icon}</span>}
       </div>
-      <p className="mt-2 text-2xl font-semibold tracking-tight">{value}</p>
+      <div className="mt-2 text-2xl font-semibold tracking-tight">{value}</div>
       {sub && <p className="mt-1 text-xs text-muted">{sub}</p>}
     </Card>
   );

@@ -11,7 +11,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import auth, db, production_readiness, settings_store
+from app import auth, db, generation_config, production_readiness, settings_store
 from app.compiler.gpt_image import compile_image_prompt
 
 # Load provider keys from .env into the environment before anything reads them.
@@ -19,6 +19,7 @@ settings_store.load_env()
 from app.pipeline import create_project
 from app.schema import Project, QCOverride, StoryboardApproval
 from app.snapshots import snapshot_project
+from app.stages import scene_consistency
 from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
 from app.storage import Storage
@@ -196,6 +197,24 @@ async def describe(photos: list[UploadFile]) -> dict:
     return {"description": text, "cost_cents": cost}
 
 
+@app.post("/uploads/precheck")
+async def uploads_precheck(photos: list[UploadFile]) -> dict:
+    """Customer-facing photo quality gate, run before a project exists.
+
+    Tells the customer per photo whether it is good enough to build a correct
+    ad from (good / usable / replace + friendly tips). Consumes nothing
+    durable; the optional AI screen is one metered vision call."""
+    from app.stages import upload_precheck
+
+    if not photos:
+        raise HTTPException(422, "at least one photo is required")
+    payloads = [(p.filename or f"photo-{i + 1}.jpg", await p.read(),
+                 p.content_type or "image/jpeg")
+                for i, p in enumerate(photos[:8])]
+    result = await run_in_threadpool(upload_precheck.run, payloads)
+    return result.model_dump(mode="json")
+
+
 @app.post("/projects")
 async def post_project(
     session: SessionDep,
@@ -208,20 +227,39 @@ async def post_project(
     tone: Annotated[Optional[str], Form()] = None,
     style: Annotated[Optional[str], Form()] = None,
     target_duration_s: Annotated[Optional[float], Form()] = None,
+    mode: Annotated[Literal["manual", "auto"], Form()] = "manual",
+    remake_goal: Annotated[Optional[str], Form()] = None,
+    reference_video: Optional[UploadFile] = None,
 ) -> dict:
     if not photos:
         raise HTTPException(422, "at least one photo is required")
     user = UserInputs(
         audience=audience, offer=offer, cta=cta, tone=tone,
         style=style, target_duration_s=target_duration_s,
+        remake_goal=remake_goal,
     )
     payloads = [(p.filename or "photo.jpg", await p.read()) for p in photos]
+    reference_payload = None
+    if reference_video is not None:
+        content_type = reference_video.content_type or ""
+        if not content_type.startswith("video/"):
+            raise HTTPException(422, "reference ad must be a video file")
+        reference_payload = (
+            reference_video.filename or "reference-ad.mp4",
+            await reference_video.read(),
+        )
     try:
         # create_project is ~40-50s of blocking CPU (rembg) + network (4 LLM
         # stages) for a multi-photo batch. Run it off the event loop so the
         # single-worker server stays responsive and the connection isn't reset.
-        return await run_in_threadpool(
-            lambda: enriched(create_project(session, storage, payloads, description, user)))
+        project = await run_in_threadpool(
+            lambda: create_project(session, storage, payloads, description, user,
+                                   reference_video=reference_payload))
+        if mode == "auto":
+            await run_in_threadpool(
+                lambda: _start_autopilot(session, project.project_id))
+            _, project = _load_project(session, project.project_id)
+        return enriched(project)
     except StoryboardValidationError as exc:
         raise HTTPException(422, {
             "error_code": StoryboardValidationError.error_code,
@@ -451,6 +489,65 @@ def patch_scene(
     if reverted:
         reason += " (storyboard approval reverted to draft)"
     snapshot_project(session, project, actor="user", reason=reason)
+    session.commit()
+    return enriched(project)
+
+
+def _start_autopilot(session: Session, project_id: str) -> Project:
+    """Approve the storyboard (auto mode is explicit consent for the build)
+    and hand the project to the auto-pilot worker."""
+    from datetime import datetime, timezone
+
+    from app.workers import autopilot
+
+    row, project = _load_project(session, project_id)
+    if project.storyboard_approval.status != "approved":
+        project.storyboard_approval = StoryboardApproval(
+            status="approved",
+            approved_at=datetime.now(timezone.utc).isoformat(),
+            approved_by="autopilot",
+        )
+        version = snapshot_project(session, project, actor="autopilot",
+                                   reason="storyboard approved (auto mode)")
+        project.storyboard_approval.approved_version_id = version.version_id
+    # Resume is an explicit request to try a failed final-production job
+    # again.  Terminal jobs are not active, but leaving one attached causes
+    # the auto-pilot to immediately repeat its old error instead of creating
+    # a fresh idempotent production run.
+    if project.production_job and project.production_job.status == "failed":
+        project.production_job = None
+    project.automation.mode = "auto"
+    project.automation.status = "generating_images"
+    project.automation.detail = "Generating and quality-checking a still for every scene."
+    project.automation.updated_at = datetime.now(timezone.utc).isoformat()
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="autopilot", reason="autopilot started")
+    session.commit()
+    autopilot.run_autopilot.delay(project_id)
+    return project
+
+
+class AutopilotAction(BaseModel):
+    action: Literal["start", "stop"]
+
+
+@app.post("/projects/{project_id}/autopilot")
+def autopilot_control(project_id: str, body: AutopilotAction,
+                      session: SessionDep) -> dict:
+    """Start/resume or pause the hands-free build. Stopping returns the
+    project to normal manual editing; nothing is deleted."""
+    from datetime import datetime, timezone
+
+    row, project = _load_project(session, project_id)
+    if body.action == "start":
+        project = _start_autopilot(session, project_id)
+        return enriched(project)
+    project.automation.mode = "manual"
+    project.automation.status = "idle"
+    project.automation.detail = "Paused — you are in manual control."
+    project.automation.updated_at = datetime.now(timezone.utc).isoformat()
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user", reason="autopilot paused")
     session.commit()
     return enriched(project)
 
@@ -717,6 +814,37 @@ def select_video(project_id: str, scene_id: str, body: SelectImage,
     return enriched(project)
 
 
+def _run_scene_consistency(session: Session, storage: Storage,
+                           project_id: str) -> Project:
+    """Run the cross-scene identity check, store the report, meter the spend."""
+    row, project = _load_project(session, project_id)
+    try:
+        report, cost = scene_consistency.run_check(project, storage)
+    except ValueError as exc:
+        raise HTTPException(422, {
+            "error_code": "IDENTITY_CONSISTENCY_INPUT_MISSING",
+            "message": str(exc),
+        })
+    project.scene_consistency = report
+    project.cost.qc += cost
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"identity-consistency check "
+                            f"({'consistent' if report.consistent else 'inconsistent'})")
+    session.commit()
+    log.info("scene consistency project=%s consistent=%s cost_cents=%d",
+             project_id, report.consistent, cost)
+    return project
+
+
+@app.post("/projects/{project_id}/identity-consistency")
+def identity_consistency(project_id: str, session: SessionDep,
+                         storage: StorageDep) -> dict:
+    """Re-judge all selected scene images against the primary product reference."""
+    project = _run_scene_consistency(session, storage, project_id)
+    return project.scene_consistency.model_dump(mode="json")
+
+
 @app.get("/api/projects/{project_id}/production-readiness")
 @app.get("/projects/{project_id}/production-readiness")
 def production_readiness_endpoint(project_id: str, session: SessionDep) -> dict:
@@ -733,12 +861,21 @@ def production_readiness_endpoint(project_id: str, session: SessionDep) -> dict:
 
 
 @app.post("/projects/{project_id}/produce")
-def produce(project_id: str, session: SessionDep) -> dict:
+def produce(project_id: str, session: SessionDep, storage: StorageDep) -> dict:
     """Run stages 6→9. Backend readiness is the source of truth."""
     row, project = _load_project(session, project_id)
     active_job = production_readiness.active_job(project)
     if active_job:
         return {"status": "producing", "production_job": active_job.model_dump(mode="json")}
+    if (
+        generation_config.SCENE_CONSISTENCY_QC_ENABLED
+        and not scene_consistency.is_current(project)
+        and all(s.selected_image for s in project.scenes)
+        and os.environ.get("OPENAI_API_KEY")
+    ):
+        # cross-scene identity gate: judged BEFORE any video spend
+        project = _run_scene_consistency(session, storage, project_id)
+        row, project = _load_project(session, project_id)
     readiness = production_readiness.validate(project)
     if not readiness.ready:
         log.info("production blocked project=%s blockers=%s",

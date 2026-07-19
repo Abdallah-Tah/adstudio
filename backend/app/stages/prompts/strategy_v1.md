@@ -12,6 +12,8 @@ Rules:
 - `style_id`: choose exactly one of: $style_ids
 - `scene_count`: enough scenes to cover the script, each scene 0.5-8.0 seconds.
 - Plain spoken language. No trademarked third-party brand names.
+- If the brief contains a `reference_ad_dna`, translate its creative language
+  for THIS product. Do not reuse the reference ad's brands, claims, or script.
 
 Brief:
 

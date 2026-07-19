@@ -13,6 +13,29 @@ class AssetRef(BaseModel):
     created_at: str                           # ISO 8601
 
 
+class ReferenceAdDNA(BaseModel):
+    """The transferable creative language sampled from a reference ad.
+
+    This intentionally describes pacing and production choices, never copies
+    another advertiser's branding, product claims, spoken script, or logo.
+    """
+    format: str = "vertical 9:16"
+    pacing: str
+    visual_world: str
+    color_palette: list[str] = Field(default_factory=list)
+    camera_language: list[str] = Field(default_factory=list)
+    transition_language: str
+    shot_beats: list[str] = Field(default_factory=list, max_length=12)
+    copy_patterns: list[str] = Field(default_factory=list, max_length=5)
+    hook_options: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ReferenceAd(BaseModel):
+    asset: AssetRef
+    goal: str
+    dna: ReferenceAdDNA
+
+
 class ProductReference(BaseModel):
     asset_id: str
     reference_type: Literal[
@@ -83,6 +106,42 @@ class ProductIdentityQC(BaseModel):
             and not self.invented_parts
             and not self.missing_parts
         )
+
+
+class AutomationState(BaseModel):
+    """Auto-pilot: the customer hands the whole build to the AI after the
+    upload quality gate. Manual mode is untouched — automation only drives the
+    same gated primitives (approve -> images -> QC select -> consistency ->
+    produce) and drops to needs_review instead of ever forcing a gate."""
+    mode: Literal["manual", "auto"] = "manual"
+    status: Literal[
+        "idle", "generating_images", "checking_consistency", "producing",
+        "completed", "needs_review", "failed",
+    ] = "idle"
+    detail: str = ""
+    updated_at: Optional[str] = None
+
+
+class SceneConsistencyVerdict(BaseModel):
+    scene_id: str
+    consistent: bool
+    drifted_features: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class SceneConsistencyReport(BaseModel):
+    """Cross-scene product identity check over the selected scene images.
+
+    Scenes are generated independently, so each can pass per-scene identity QC
+    against the uploads while still disagreeing with each other. This report is
+    the production gate for that failure mode. `fingerprint` binds the verdict
+    to the exact set of selected images it judged — reselecting any image makes
+    the report stale."""
+    checked_at: str
+    fingerprint: str
+    consistent: bool
+    verdicts: list[SceneConsistencyVerdict] = Field(default_factory=list)
+    cost_cents: int = 0
 
 
 class QCOverride(BaseModel):
@@ -159,6 +218,7 @@ class ProcessingWarning(BaseModel):
         "segmentation_failed",
         "segmentation_low_coverage",
         "segmentation_high_coverage",
+        "segmentation_fragmented",
         "unsupported_image",
         "reference_low_resolution",
         "reference_extreme_crop",
@@ -236,6 +296,8 @@ class CreativeBrief(BaseModel):
     cta: str
     platform: Literal["tiktok"] = "tiktok"
     target_duration_s: float = Field(ge=10, le=60)
+    remake_goal: Optional[str] = None
+    reference_ad_dna: Optional[ReferenceAdDNA] = None
 
 
 class Strategy(BaseModel):
@@ -345,6 +407,7 @@ class Project(BaseModel):
     project_id: str
     created_at: str
     product: ProductProfile
+    reference_ad: Optional[ReferenceAd] = None
     brief: CreativeBrief
     strategy: Strategy
     scenes: list[Scene] = Field(min_length=3, max_length=12)
@@ -353,6 +416,8 @@ class Project(BaseModel):
     music: Optional[AssetRef] = None
     music_license: Optional[MusicLicense] = None
     final_render: Optional[AssetRef] = None
+    scene_consistency: Optional[SceneConsistencyReport] = None
+    automation: AutomationState = Field(default_factory=AutomationState)
     production_job: Optional[ProductionJob] = None
     cost: CostLedger = Field(default_factory=CostLedger)
 

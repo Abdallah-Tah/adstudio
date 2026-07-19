@@ -102,6 +102,14 @@ type Scene = {
 
 type ProcessingWarning = { code: string; message: string; asset_id: string | null };
 
+type AutomationState = {
+  mode: "manual" | "auto";
+  status: "idle" | "generating_images" | "checking_consistency" | "producing"
+        | "completed" | "needs_review" | "failed";
+  detail: string;
+  updated_at: string | null;
+};
+
 type Project = {
   project_id: string;
   product: { name: string; processing_warnings: ProcessingWarning[] };
@@ -110,8 +118,24 @@ type Project = {
   scenes: Scene[];
   storyboard_approval: { status: string; approved_at: string | null };
   final_render: { asset_id: string } | null;
+  automation?: AutomationState;
   production_job: ProductionJob | null;
   cost: Record<string, number> & { total: number };
+  reference_ad?: {
+    goal: string;
+    dna: { hook_options: string[]; visual_world: string; pacing: string };
+  } | null;
+};
+
+const AUTOPILOT_ACTIVE = new Set(["generating_images", "checking_consistency", "producing"]);
+const AUTOPILOT_LABEL: Record<AutomationState["status"], string> = {
+  idle: "Auto-pilot",
+  generating_images: "Auto-pilot · generating scene images",
+  checking_consistency: "Auto-pilot · checking product identity across scenes",
+  producing: "Auto-pilot · producing your video",
+  completed: "Auto-pilot · your ad is ready",
+  needs_review: "Auto-pilot paused · needs your review",
+  failed: "Auto-pilot stopped",
 };
 
 /* ------------------------------- helpers -------------------------------- */
@@ -241,6 +265,13 @@ function sceneNumbersFromBlockers(readiness: ProductionReadiness | null, project
     .map((order) => order + 1);
 }
 function readinessMessage(readiness: ProductionReadiness | null, project: Project | null) {
+  const inconsistent = sceneNumbersFromBlockers(readiness, project, ["PRODUCT_IDENTITY_INCONSISTENT"]);
+  if (inconsistent.length > 0) {
+    const scenes = inconsistent.length === 1
+      ? `Scene ${inconsistent[0]}`
+      : `Scenes ${inconsistent.slice(0, -1).join(", ")} and ${inconsistent[inconsistent.length - 1]}`;
+    return `Cannot produce ad yet. ${scenes} shows a different-looking product than the other scenes (cross-scene identity check). Regenerate or reselect the image${inconsistent.length === 1 ? "" : "s"} so every scene shows the exact uploaded product.`;
+  }
   const nums = sceneNumbersFromBlockers(readiness, project, ["SCENE_QC_FAILED"]);
   const exhausted = sceneNumbersFromBlockers(readiness, project, ["SCENE_VIDEO_ATTEMPTS_EXHAUSTED"]);
   if (nums.length > 0) {
@@ -288,6 +319,8 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   const [dragFrom, setDragFrom] = useState<number | null>(null);
   const [tab, setTab] = useState<(typeof TABS)[number][0]>("preview");
   const [menu, setMenu] = useState<{ x: number; y: number; idx: number } | null>(null);
+  const [showHookPack, setShowHookPack] = useState(false);
+  const [overrideSceneId, setOverrideSceneId] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     Promise.all([
@@ -303,7 +336,8 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   useEffect(() => {
     if (!project) return;
     const busy = project.scenes.some((s) => s.generations.some(isActive)) ||
-      isProductionActive(project.production_job);
+      isProductionActive(project.production_job) ||
+      (project.automation?.mode === "auto" && AUTOPILOT_ACTIVE.has(project.automation.status));
     if (!busy) return;
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
@@ -387,11 +421,16 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
       setError("No QC-rejected video with an uploaded asset is available to override.");
       return;
     }
-    const typed = window.prompt(`Type this exact sentence to override product identity QC:\n\n${VIDEO_QC_OVERRIDE_ACK}`);
-    if (typed !== VIDEO_QC_OVERRIDE_ACK) {
-      setError("QC override cancelled. The acknowledgement sentence must match exactly.");
+    setOverrideSceneId(sceneId);
+  }
+  function confirmRejectedVideoOverride(sceneId: string) {
+    const candidate = latestRejectedVideo(sceneId);
+    if (!candidate) {
+      setOverrideSceneId(null);
+      setError("No QC-rejected video with an uploaded asset is available to override.");
       return;
     }
+    setOverrideSceneId(null);
     setReadinessOpen(false);
     return act(() => postJSON(
       `/projects/${pid}/scenes/${sceneId}/videos/${candidate.generation_id}/override-qc`,
@@ -459,6 +498,11 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           {project.strategy.hook}
         </p>
         <div className="ml-auto flex items-center gap-2">
+          {project.reference_ad?.dna.hook_options.length ? (
+            <Button size="sm" variant="outline" onClick={() => setShowHookPack((open) => !open)}>
+              <Icon name="copy" size={14} /> {showHookPack ? "Hide hooks" : "Hook pack"}
+            </Button>
+          ) : null}
           {!approved ? (
             <Button size="sm" variant="outline" onClick={() => act(() => postJSON(`/projects/${pid}/storyboard/approve`))}>
               <Icon name="check" size={14} /> Approve storyboard
@@ -493,6 +537,69 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           )}
         </div>
       </div>
+      {showHookPack && project.reference_ad && (
+        <div className="border-b border-line bg-accent-soft/20 px-4 py-3">
+          <div className="mb-2 flex items-center gap-2">
+            <Icon name="film" size={14} className="text-accent-2" />
+            <p className="text-xs font-medium">Reference-ad hook pack</p>
+            <span className="text-xs text-muted">{project.reference_ad.dna.pacing} · {project.reference_ad.dna.visual_world}</span>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {project.reference_ad.dna.hook_options.map((hook, index) => (
+              <button key={hook} type="button" onClick={() => navigator.clipboard.writeText(hook)}
+                className="rounded-lg border border-line bg-surface px-3 py-2 text-left text-xs text-ink-2 hover:border-accent"
+                title="Copy hook">
+                <span className="mr-1 text-muted">{index + 1}.</span>{hook}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {project.automation && (project.automation.mode === "auto" ||
+        ["needs_review", "failed", "completed"].includes(project.automation.status)) &&
+        project.automation.status !== "idle" && !project.final_render && (
+        <div className={cn(
+          "flex items-start gap-3 border-b px-4 py-2.5 text-sm",
+          project.automation.status === "needs_review" ? "border-warn/30 bg-warn/10" :
+          project.automation.status === "failed" ? "border-danger/30 bg-danger/10" :
+          "border-accent/20 bg-accent-soft/40"
+        )}>
+          <span className={cn(
+            "mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-white",
+            project.automation.status === "needs_review" ? "bg-warn" :
+            project.automation.status === "failed" ? "bg-danger" :
+            "bg-gradient-to-br from-violet-600 to-fuchsia-600"
+          )}>
+            <Icon name={project.automation.status === "needs_review" || project.automation.status === "failed"
+              ? "alertTriangle" : "sparkles"} size={13} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              {AUTOPILOT_LABEL[project.automation.status]}
+              {AUTOPILOT_ACTIVE.has(project.automation.status) && (
+                <span className="ml-2 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent align-middle" />
+              )}
+            </p>
+            {project.automation.detail && (
+              <p className="truncate text-xs text-secondary" title={project.automation.detail}>
+                {project.automation.detail}
+              </p>
+            )}
+          </div>
+          {AUTOPILOT_ACTIVE.has(project.automation.status) ? (
+            <Button size="sm" variant="outline"
+              onClick={() => act(() => postJSON(`/projects/${pid}/autopilot`, { action: "stop" }))}>
+              <Icon name="pause" size={13} /> Pause
+            </Button>
+          ) : project.automation.status !== "completed" && (
+            <Button size="sm" variant="accent"
+              onClick={() => act(() => postJSON(`/projects/${pid}/autopilot`, { action: "start" }))}>
+              <Icon name="play" size={13} /> Resume auto-pilot
+            </Button>
+          )}
+        </div>
+      )}
 
       {readinessOpen && (
         <ProductionReadinessModal
@@ -503,6 +610,12 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           onOpenScene={openScene}
           onRegenerateFailed={regenerateBlockedScenes}
           onOverrideScene={overrideRejectedVideo}
+        />
+      )}
+      {overrideSceneId && (
+        <QCOverrideModal
+          onClose={() => setOverrideSceneId(null)}
+          onConfirm={() => confirmRejectedVideoOverride(overrideSceneId)}
         />
       )}
 
@@ -1018,6 +1131,39 @@ function FinalRenderBar({ project }: { project: Project }) {
       <a href={assetUrl(project.project_id, project.final_render!.asset_id)} download>
         <Button size="sm" variant="accent"><Icon name="download" size={14} /> Download MP4</Button>
       </a>
+    </div>
+  );
+}
+
+function QCOverrideModal({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  const [typed, setTyped] = useState("");
+  const matches = typed === VIDEO_QC_OVERRIDE_ACK;
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-labelledby="qc-override-title">
+      <div className="w-full max-w-lg rounded-xl border border-warn/40 bg-surface p-5 shadow-xl">
+        <div className="flex items-start gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-warn-soft text-warn">
+            <Icon name="alertTriangle" size={18} />
+          </span>
+          <div>
+            <h2 id="qc-override-title" className="text-h3">Override product identity QC</h2>
+            <p className="mt-1 text-sm text-muted">This video did not fully match the uploaded product. Only continue if you accept that risk.</p>
+          </div>
+        </div>
+        <label className="mt-4 block">
+          <span className="mb-1.5 block text-xs font-medium text-ink">Type this exact acknowledgement</span>
+          <code className="block rounded-md bg-surface-2 p-2 text-xs text-ink-2">{VIDEO_QC_OVERRIDE_ACK}</code>
+          <textarea value={typed} onChange={(e) => setTyped(e.target.value)} rows={3}
+            className="focus-ring mt-2 w-full rounded-lg border border-line bg-surface p-2 text-sm"
+            placeholder="Type the acknowledgement exactly" autoFocus />
+        </label>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button size="sm" variant="outline" onClick={onClose}>Cancel</Button>
+          <Button size="sm" variant="warn" disabled={!matches} onClick={onConfirm}>
+            Override QC
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -25,8 +25,31 @@ const PIPELINE = [
   { key: "strategy", label: "Strategy", eta: 7 },
   { key: "storyboard", label: "Storyboard", eta: 12 },
 ] as const;
+const REFERENCE_STAGE = { key: "reference", label: "Reference-ad analysis", eta: 12 } as const;
 
 type Photo = { file: File; url: string };
+type ReferenceVideo = { file: File };
+
+type PhotoIssue = { code: string; message: string; tip: string };
+type PhotoVerdict = {
+  filename: string;
+  verdict: "good" | "usable" | "replace";
+  quality_score: number;
+  cutout_ok: boolean;
+  issues: PhotoIssue[];
+};
+type Precheck = {
+  ok_to_proceed: boolean;
+  summary: string;
+  photos: PhotoVerdict[];
+  ai_checked: boolean;
+};
+
+const VERDICT_UI = {
+  good: { label: "Great photo", cls: "bg-success/10 text-success border-success/30" },
+  usable: { label: "Usable", cls: "bg-warn/10 text-warn border-warn/30" },
+  replace: { label: "Replace", cls: "bg-danger/10 text-danger border-danger/30" },
+} as const;
 
 export default function CreateAd() {
   usePageHeader({ breadcrumb: [{ label: "Create Ad" }] });
@@ -43,15 +66,47 @@ export default function CreateAd() {
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [stageIdx, setStageIdx] = useState(0);
+  const [mode, setMode] = useState<"manual" | "auto">("auto");
+  const [remakeEnabled, setRemakeEnabled] = useState(false);
+  const [referenceVideo, setReferenceVideo] = useState<ReferenceVideo | null>(null);
+  const [remakeGoal, setRemakeGoal] = useState("");
+  const [precheck, setPrecheck] = useState<Precheck | null>(null);
+  const [precheckLoading, setPrecheckLoading] = useState(false);
+  const [precheckError, setPrecheckError] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
+  const videoInput = useRef<HTMLInputElement>(null);
   const descReq = useRef(0);
+  const precheckReq = useRef(0);
+
+  async function runPrecheck(current: Photo[]) {
+    if (current.length === 0) { setPrecheck(null); setPrecheckError(""); return; }
+    const id = ++precheckReq.current;
+    setPrecheckLoading(true);
+    setPrecheckError("");
+    try {
+      const fd = new FormData();
+      current.forEach((p) => fd.append("photos", p.file));
+      const r = await fetch(`${API}/uploads/precheck`, { method: "POST", credentials: "include", body: fd });
+      if (!r.ok) throw new Error(await r.text());
+      const result: Precheck = await r.json();
+      if (id === precheckReq.current) setPrecheck(result);
+    } catch {
+      if (id === precheckReq.current) {
+        setPrecheck(null);
+        setPrecheckError("We couldn't check these photos. Retry the quality check before continuing.");
+      }
+    } finally {
+      if (id === precheckReq.current) setPrecheckLoading(false);
+    }
+  }
 
   function addFiles(list: FileList | File[]) {
-    const next = [...photos];
-    for (const f of Array.from(list)) {
-      if (f.type.startsWith("image/")) next.push({ file: f, url: URL.createObjectURL(f) });
-    }
-    setPhotos(next.slice(0, 8));
+    const images = Array.from(list).filter((f) => f.type.startsWith("image/"));
+    if (images.length === 0) return;
+    setPhotos((current) => [
+      ...current,
+      ...images.map((file) => ({ file, url: URL.createObjectURL(file) })),
+    ].slice(0, 8));
   }
 
   async function generateDescription(current: Photo[]) {
@@ -73,20 +128,25 @@ export default function CreateAd() {
   }
 
   useEffect(() => {
-    if (photos.length === 0) { setDescription(""); setDescEdited(false); return; }
+    if (photos.length === 0) { setDescription(""); setDescEdited(false); setPrecheck(null); setPrecheckError(""); return; }
     if (!descEdited) generateDescription(photos);
+    runPrecheck(photos);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [photos]);
 
+  const pipeline = referenceVideo ? [PIPELINE[0], REFERENCE_STAGE, ...PIPELINE.slice(1)] : PIPELINE;
+
   useEffect(() => {
     if (!running) return;
-    if (stageIdx >= PIPELINE.length - 1) return;
-    const t = setTimeout(() => setStageIdx((i) => i + 1), PIPELINE[stageIdx].eta * 1000);
+    if (stageIdx >= pipeline.length - 1) return;
+    const t = setTimeout(() => setStageIdx((i) => i + 1), pipeline[stageIdx].eta * 1000);
     return () => clearTimeout(t);
-  }, [running, stageIdx]);
+  }, [running, stageIdx, pipeline]);
 
+  const photosOk = !precheck || precheck.ok_to_proceed;
   const canNext =
-    step === 0 ? photos.length > 0 && !descLoading && description.trim().length > 10 :
+    step === 0 ? photos.length > 0 && (!remakeEnabled || referenceVideo !== null) && !descLoading && !precheckLoading && !precheckError &&
+                 photosOk && description.trim().length > 10 :
     step === 1 ? true : step === 2 ? true : true;
 
   async function submit() {
@@ -99,23 +159,30 @@ export default function CreateAd() {
     if (brief.cta) fd.append("cta", brief.cta);
     if (brief.tone) fd.append("tone", brief.tone);
     if (style) fd.append("style", style);
+    if (referenceVideo) fd.append("reference_video", referenceVideo.file);
+    if (remakeGoal.trim()) fd.append("remake_goal", remakeGoal.trim());
     fd.append("target_duration_s", String(duration));
+    fd.append("mode", mode);
     try {
       const r = await fetch(`${API}/projects`, { method: "POST", credentials: "include", body: fd });
       if (!r.ok) throw new Error(await r.text());
       const project = await r.json();
-      setStageIdx(PIPELINE.length);
+      setStageIdx(pipeline.length);
       window.location.href = `/projects/${project.project_id}`;
     } catch (e) { setError(String(e)); setRunning(false); }
   }
 
   if (running) {
     const steps: Step[] = [
-      ...PIPELINE.map((s, i): Step => ({
+      ...pipeline.map((s, i): Step => ({
         label: s.label,
         state: i < stageIdx ? "done" : i === stageIdx ? "active" : "pending",
       })),
-      { label: "Images · Videos · Render", state: "pending", hint: "next, in the editor" },
+      {
+        label: "Images · Videos · Render",
+              state: "pending",
+        hint: mode === "auto" ? "auto-pilot continues on the project page" : "next, in the editor",
+      },
     ];
     return (
       <div className="mx-auto flex max-w-md flex-col justify-center gap-6 p-8 pt-20">
@@ -133,7 +200,15 @@ export default function CreateAd() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8 p-6 md:p-8 lg:p-10">
+    <div
+      className="mx-auto max-w-3xl space-y-8 p-6 md:p-8 lg:p-10"
+      onPaste={(e) => {
+        const images = Array.from(e.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+        if (images.length === 0) return;
+        e.preventDefault();
+        addFiles(images);
+      }}
+    >
       <div>
         <h1 className="text-h1">Create New Advertisement</h1>
         <p className="mt-1 text-secondary">Four steps, then the storyboard engine takes over.</p>
@@ -180,26 +255,77 @@ export default function CreateAd() {
             </span>
             <div>
               <p className="text-h3">Drag product photos here</p>
-              <p className="text-caption">or click to browse · up to 8 · every angle sharpens identity</p>
+              <p className="text-caption">or click to browse · paste with ⌘V/Ctrl+V · up to 8</p>
             </div>
             <input ref={fileInput} type="file" accept="image/*" multiple hidden
                    onChange={(e) => e.target.files && addFiles(e.target.files)} />
           </div>
 
+          <Card className={cn("border p-4", remakeEnabled ? "border-accent bg-accent-soft/20" : "border-line")}>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-h3">Remake a reference ad</p>
+                <p className="mt-1 text-caption">Upload a video you like. We analyse its pacing and visual language, then build an original campaign around your product.</p>
+              </div>
+              <button type="button" onClick={() => setRemakeEnabled((value) => !value)}
+                className={cn("rounded-full px-3 py-1.5 text-xs font-medium", remakeEnabled ? "bg-accent text-accent-ink" : "bg-surface-2 text-muted")}>{remakeEnabled ? "Enabled" : "Add reference"}</button>
+            </div>
+            {remakeEnabled && (
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                <input ref={videoInput} type="file" accept="video/mp4,video/quicktime,video/webm" hidden
+                  onChange={(e) => e.target.files?.[0] && setReferenceVideo({ file: e.target.files[0] })} />
+                {referenceVideo ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2 text-sm">
+                    <Icon name="video" size={15} className="text-accent-2" />
+                    <span className="max-w-56 truncate">{referenceVideo.file.name}</span>
+                    <button type="button" onClick={() => setReferenceVideo(null)} className="text-danger">✕</button>
+                  </div>
+                ) : (
+                  <Button variant="outline" size="sm" onClick={() => videoInput.current?.click()}>
+                    <Icon name="video" size={14} /> Upload reference video
+                  </Button>
+                )}
+                <span className="text-xs text-muted">MP4, MOV, or WebM · up to 100 MB</span>
+              </div>
+            )}
+          </Card>
+
           {photos.length > 0 && (
             <div>
-              <p className="mb-2 text-overline">Reference images · {photos.length}/8</p>
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-overline">Reference images · {photos.length}/8</p>
+                {precheckLoading && (
+                  <span className="flex items-center gap-1.5 text-xs text-muted">
+                    <Icon name="sparkles" size={12} className="animate-pulse" /> Checking photo quality…
+                  </span>
+                )}
+              </div>
               <div className="flex flex-wrap gap-3">
-                {photos.map((p, i) => (
-                  <div key={i} className="group relative">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={p.url} alt="" className="h-24 w-24 rounded-xl border border-line object-cover" />
-                    <button
-                      onClick={() => setPhotos(photos.filter((_, j) => j !== i))}
-                      className="absolute -right-1.5 -top-1.5 hidden h-5 w-5 items-center justify-center rounded-full bg-danger text-[10px] text-white shadow group-hover:flex"
-                    >✕</button>
-                  </div>
-                ))}
+                {photos.map((p, i) => {
+                  const v = precheck?.photos[i];
+                  return (
+                    <div key={i} className="group relative w-24">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={p.url} alt="" className={cn(
+                        "h-24 w-24 rounded-xl border object-cover",
+                        v?.verdict === "replace" ? "border-danger" :
+                        v?.verdict === "usable" ? "border-warn" : "border-line"
+                      )} />
+                      <button
+                        onClick={() => setPhotos(photos.filter((_, j) => j !== i))}
+                        className="absolute -right-1.5 -top-1.5 hidden h-5 w-5 items-center justify-center rounded-full bg-danger text-[10px] text-white shadow group-hover:flex"
+                      >✕</button>
+                      {v && !precheckLoading && (
+                        <span className={cn(
+                          "mt-1 block truncate rounded-full border px-1.5 py-0.5 text-center text-[10px] font-medium",
+                          VERDICT_UI[v.verdict].cls
+                        )}>
+                          {VERDICT_UI[v.verdict].label}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
                 {photos.length < 8 && (
                   <button onClick={() => fileInput.current?.click()}
                           className="flex h-24 w-24 items-center justify-center rounded-xl border border-dashed border-line text-muted hover:border-line-strong">
@@ -207,6 +333,39 @@ export default function CreateAd() {
                   </button>
                 )}
               </div>
+              {precheck && !precheckLoading && (
+                <div className={cn(
+                  "mt-3 space-y-2 rounded-xl border p-3 text-sm",
+                  precheck.ok_to_proceed ? "border-line bg-surface-2" : "border-danger/40 bg-danger/5"
+                )}>
+                  <p className={cn("font-medium", !precheck.ok_to_proceed && "text-danger")}>
+                    {precheck.ok_to_proceed ? "✓ " : ""}{precheck.summary}
+                    {precheck.ai_checked && (
+                      <span className="ml-2 text-[10px] font-normal text-muted">AI-reviewed</span>
+                    )}
+                  </p>
+                  {precheck.photos.some((p) => p.issues.length > 0) && (
+                    <ul className="space-y-1 text-xs text-secondary">
+                      {precheck.photos.flatMap((p, i) =>
+                        p.issues.map((issue, j) => (
+                          <li key={`${i}-${j}`}>
+                            <span className="font-medium">Photo {i + 1}:</span> {issue.message}.
+                            {issue.tip && <span className="text-muted"> {issue.tip}</span>}
+                          </li>
+                        ))
+                      )}
+                    </ul>
+                  )}
+                </div>
+              )}
+              {precheckError && !precheckLoading && (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-danger/40 bg-danger/5 p-3 text-sm">
+                  <p className="text-danger">{precheckError}</p>
+                  <Button variant="outline" size="sm" onClick={() => runPrecheck(photos)}>
+                    Retry
+                  </Button>
+                </div>
+              )}
             </div>
           )}
 
@@ -241,6 +400,15 @@ export default function CreateAd() {
       {/* STEP 1 — brief */}
       {step === 1 && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          {remakeEnabled && (
+            <label className="block sm:col-span-2">
+              <span className="mb-1.5 block text-overline">Campaign goal</span>
+              <textarea rows={3} value={remakeGoal} onChange={(e) => setRemakeGoal(e.target.value)}
+                placeholder="e.g. Turn this product into an energetic 15-second Meta ad with multiple scroll-stopping hooks. Keep the reference's premium pace, but make every claim specific to my product."
+                className="focus-ring w-full rounded-xl border border-line bg-surface p-3 text-sm" />
+              <span className="mt-1 block text-xs text-muted">We borrow the creative language, never the source brand, logo, claims, or exact copy.</span>
+            </label>
+          )}
           {([["audience", "Audience", "e.g. busy parents who care about ingredients"],
              ["offer", "Offer", "e.g. 20% off launch week"],
              ["cta", "Call to action", "e.g. Shop now"],
@@ -289,6 +457,38 @@ export default function CreateAd() {
 
       {/* STEP 3 — review */}
       {step === 3 && (
+        <>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <button onClick={() => setMode("auto")}
+            className={cn("rounded-xl border p-4 text-left transition-all",
+              mode === "auto" ? "border-accent ring-1 ring-accent" : "border-line hover:border-line-strong")}>
+            <div className="mb-2 flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-600 to-fuchsia-600 text-white">
+                <Icon name="sparkles" size={15} />
+              </span>
+              <p className="text-h3">Auto-pilot</p>
+            </div>
+            <p className="text-caption">
+              The AI builds everything: storyboard, quality-checked scene images,
+              and the final video — hands-free. It pauses and asks you only if the
+              product identity check fails.
+            </p>
+          </button>
+          <button onClick={() => setMode("manual")}
+            className={cn("rounded-xl border p-4 text-left transition-all",
+              mode === "manual" ? "border-accent ring-1 ring-accent" : "border-line hover:border-line-strong")}>
+            <div className="mb-2 flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-surface-2 text-ink">
+                <Icon name="edit" size={15} />
+              </span>
+              <p className="text-h3">Manual review</p>
+            </div>
+            <p className="text-caption">
+              Review and edit every step yourself: approve the storyboard, pick
+              each scene image, then start production when you are ready.
+            </p>
+          </button>
+        </div>
         <Card className="divide-y divide-line">
           <div className="flex items-center gap-3 overflow-x-auto p-4">
             {photos.map((p, i) => (
@@ -305,6 +505,8 @@ export default function CreateAd() {
             ["Tone", brief.tone || "AI decides"],
             ["Style", STYLE_CARDS.find((s) => s.id === style)?.name ?? "AI decides"],
             ["Duration", `${duration}s`],
+            ...(referenceVideo ? [["Reference ad", referenceVideo.file.name], ["Campaign goal", remakeGoal || "Create an original ad in the reference's visual language"]] : []),
+            ["Build mode", mode === "auto" ? "Auto-pilot — AI builds the whole ad" : "Manual review"],
           ].map(([k, v]) => (
             <div key={k} className="flex gap-4 p-4 text-sm">
               <span className="w-28 shrink-0 font-medium text-muted">{k}</span>
@@ -312,6 +514,7 @@ export default function CreateAd() {
             </div>
           ))}
         </Card>
+        </>
       )}
 
       {error && <p className="text-sm text-danger">{error}</p>}
@@ -326,7 +529,8 @@ export default function CreateAd() {
           </Button>
         ) : (
           <Button variant="ai" size="lg" onClick={submit}>
-            <Icon name="sparkles" size={16} /> Generate storyboard
+            <Icon name="sparkles" size={16} />
+            {remakeEnabled ? (mode === "auto" ? "Remake my ad automatically" : "Generate remake storyboard") : (mode === "auto" ? "Build my ad automatically" : "Generate storyboard")}
           </Button>
         )}
       </div>
