@@ -102,6 +102,14 @@ type Scene = {
 
 type ProcessingWarning = { code: string; message: string; asset_id: string | null };
 
+type AutomationState = {
+  mode: "manual" | "auto";
+  status: "idle" | "generating_images" | "checking_consistency" | "producing"
+        | "completed" | "needs_review" | "failed";
+  detail: string;
+  updated_at: string | null;
+};
+
 type Project = {
   project_id: string;
   product: { name: string; processing_warnings: ProcessingWarning[] };
@@ -110,8 +118,20 @@ type Project = {
   scenes: Scene[];
   storyboard_approval: { status: string; approved_at: string | null };
   final_render: { asset_id: string } | null;
+  automation?: AutomationState;
   production_job: ProductionJob | null;
   cost: Record<string, number> & { total: number };
+};
+
+const AUTOPILOT_ACTIVE = new Set(["generating_images", "checking_consistency", "producing"]);
+const AUTOPILOT_LABEL: Record<AutomationState["status"], string> = {
+  idle: "Auto-pilot",
+  generating_images: "Auto-pilot · generating scene images",
+  checking_consistency: "Auto-pilot · checking product identity across scenes",
+  producing: "Auto-pilot · producing your video",
+  completed: "Auto-pilot · your ad is ready",
+  needs_review: "Auto-pilot paused · needs your review",
+  failed: "Auto-pilot stopped",
 };
 
 /* ------------------------------- helpers -------------------------------- */
@@ -310,7 +330,8 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
   useEffect(() => {
     if (!project) return;
     const busy = project.scenes.some((s) => s.generations.some(isActive)) ||
-      isProductionActive(project.production_job);
+      isProductionActive(project.production_job) ||
+      (project.automation?.mode === "auto" && AUTOPILOT_ACTIVE.has(project.automation.status));
     if (!busy) return;
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
@@ -500,6 +521,51 @@ export default function Editor({ params }: { params: Promise<{ id: string }> }) 
           )}
         </div>
       </div>
+
+      {project.automation && (project.automation.mode === "auto" ||
+        ["needs_review", "failed", "completed"].includes(project.automation.status)) &&
+        project.automation.status !== "idle" && !project.final_render && (
+        <div className={cn(
+          "flex items-start gap-3 border-b px-4 py-2.5 text-sm",
+          project.automation.status === "needs_review" ? "border-warn/30 bg-warn/10" :
+          project.automation.status === "failed" ? "border-danger/30 bg-danger/10" :
+          "border-accent/20 bg-accent-soft/40"
+        )}>
+          <span className={cn(
+            "mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-white",
+            project.automation.status === "needs_review" ? "bg-warn" :
+            project.automation.status === "failed" ? "bg-danger" :
+            "bg-gradient-to-br from-violet-600 to-fuchsia-600"
+          )}>
+            <Icon name={project.automation.status === "needs_review" || project.automation.status === "failed"
+              ? "alertTriangle" : "sparkles"} size={13} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              {AUTOPILOT_LABEL[project.automation.status]}
+              {AUTOPILOT_ACTIVE.has(project.automation.status) && (
+                <span className="ml-2 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent align-middle" />
+              )}
+            </p>
+            {project.automation.detail && (
+              <p className="truncate text-xs text-secondary" title={project.automation.detail}>
+                {project.automation.detail}
+              </p>
+            )}
+          </div>
+          {AUTOPILOT_ACTIVE.has(project.automation.status) ? (
+            <Button size="sm" variant="outline"
+              onClick={() => act(() => postJSON(`/projects/${pid}/autopilot`, { action: "stop" }))}>
+              <Icon name="pause" size={13} /> Pause
+            </Button>
+          ) : project.automation.status !== "completed" && (
+            <Button size="sm" variant="accent"
+              onClick={() => act(() => postJSON(`/projects/${pid}/autopilot`, { action: "start" }))}>
+              <Icon name="play" size={13} /> Resume auto-pilot
+            </Button>
+          )}
+        </div>
+      )}
 
       {readinessOpen && (
         <ProductionReadinessModal

@@ -142,6 +142,16 @@ def passing_scene_consistency(monkeypatch):
     monkeypatch.setattr(scene_consistency, "run_check", fake_run_check)
 
 
+@pytest.fixture(autouse=True)
+def no_ai_precheck(monkeypatch):
+    """Upload pre-check's AI screen finds nothing by default (no network)."""
+    from app.stages import upload_precheck
+
+    monkeypatch.setattr(
+        upload_precheck, "ai_assess",
+        lambda photos: (upload_precheck._AIAssessment(findings=[]), 0))
+
+
 @pytest.fixture
 def client(sqlite_session, fake_storage, monkeypatch):
     """TestClient wired to sqlite + fake storage; rembg stubbed out."""

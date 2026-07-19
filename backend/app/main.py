@@ -197,6 +197,24 @@ async def describe(photos: list[UploadFile]) -> dict:
     return {"description": text, "cost_cents": cost}
 
 
+@app.post("/uploads/precheck")
+async def uploads_precheck(photos: list[UploadFile]) -> dict:
+    """Customer-facing photo quality gate, run before a project exists.
+
+    Tells the customer per photo whether it is good enough to build a correct
+    ad from (good / usable / replace + friendly tips). Consumes nothing
+    durable; the optional AI screen is one metered vision call."""
+    from app.stages import upload_precheck
+
+    if not photos:
+        raise HTTPException(422, "at least one photo is required")
+    payloads = [(p.filename or f"photo-{i + 1}.jpg", await p.read(),
+                 p.content_type or "image/jpeg")
+                for i, p in enumerate(photos[:8])]
+    result = await run_in_threadpool(upload_precheck.run, payloads)
+    return result.model_dump(mode="json")
+
+
 @app.post("/projects")
 async def post_project(
     session: SessionDep,
@@ -209,6 +227,7 @@ async def post_project(
     tone: Annotated[Optional[str], Form()] = None,
     style: Annotated[Optional[str], Form()] = None,
     target_duration_s: Annotated[Optional[float], Form()] = None,
+    mode: Annotated[Literal["manual", "auto"], Form()] = "manual",
 ) -> dict:
     if not photos:
         raise HTTPException(422, "at least one photo is required")
@@ -221,8 +240,13 @@ async def post_project(
         # create_project is ~40-50s of blocking CPU (rembg) + network (4 LLM
         # stages) for a multi-photo batch. Run it off the event loop so the
         # single-worker server stays responsive and the connection isn't reset.
-        return await run_in_threadpool(
-            lambda: enriched(create_project(session, storage, payloads, description, user)))
+        project = await run_in_threadpool(
+            lambda: create_project(session, storage, payloads, description, user))
+        if mode == "auto":
+            await run_in_threadpool(
+                lambda: _start_autopilot(session, project.project_id))
+            _, project = _load_project(session, project.project_id)
+        return enriched(project)
     except StoryboardValidationError as exc:
         raise HTTPException(422, {
             "error_code": StoryboardValidationError.error_code,
@@ -452,6 +476,59 @@ def patch_scene(
     if reverted:
         reason += " (storyboard approval reverted to draft)"
     snapshot_project(session, project, actor="user", reason=reason)
+    session.commit()
+    return enriched(project)
+
+
+def _start_autopilot(session: Session, project_id: str) -> Project:
+    """Approve the storyboard (auto mode is explicit consent for the build)
+    and hand the project to the auto-pilot worker."""
+    from datetime import datetime, timezone
+
+    from app.workers import autopilot
+
+    row, project = _load_project(session, project_id)
+    if project.storyboard_approval.status != "approved":
+        project.storyboard_approval = StoryboardApproval(
+            status="approved",
+            approved_at=datetime.now(timezone.utc).isoformat(),
+            approved_by="autopilot",
+        )
+        version = snapshot_project(session, project, actor="autopilot",
+                                   reason="storyboard approved (auto mode)")
+        project.storyboard_approval.approved_version_id = version.version_id
+    project.automation.mode = "auto"
+    project.automation.status = "generating_images"
+    project.automation.detail = "Generating and quality-checking a still for every scene."
+    project.automation.updated_at = datetime.now(timezone.utc).isoformat()
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="autopilot", reason="autopilot started")
+    session.commit()
+    autopilot.run_autopilot.delay(project_id)
+    return project
+
+
+class AutopilotAction(BaseModel):
+    action: Literal["start", "stop"]
+
+
+@app.post("/projects/{project_id}/autopilot")
+def autopilot_control(project_id: str, body: AutopilotAction,
+                      session: SessionDep) -> dict:
+    """Start/resume or pause the hands-free build. Stopping returns the
+    project to normal manual editing; nothing is deleted."""
+    from datetime import datetime, timezone
+
+    row, project = _load_project(session, project_id)
+    if body.action == "start":
+        project = _start_autopilot(session, project_id)
+        return enriched(project)
+    project.automation.mode = "manual"
+    project.automation.status = "idle"
+    project.automation.detail = "Paused — you are in manual control."
+    project.automation.updated_at = datetime.now(timezone.utc).isoformat()
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user", reason="autopilot paused")
     session.commit()
     return enriched(project)
 

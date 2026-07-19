@@ -85,6 +85,20 @@ class ProductIdentityQC(BaseModel):
         )
 
 
+class AutomationState(BaseModel):
+    """Auto-pilot: the customer hands the whole build to the AI after the
+    upload quality gate. Manual mode is untouched — automation only drives the
+    same gated primitives (approve -> images -> QC select -> consistency ->
+    produce) and drops to needs_review instead of ever forcing a gate."""
+    mode: Literal["manual", "auto"] = "manual"
+    status: Literal[
+        "idle", "generating_images", "checking_consistency", "producing",
+        "completed", "needs_review", "failed",
+    ] = "idle"
+    detail: str = ""
+    updated_at: Optional[str] = None
+
+
 class SceneConsistencyVerdict(BaseModel):
     scene_id: str
     consistent: bool
@@ -377,6 +391,7 @@ class Project(BaseModel):
     music_license: Optional[MusicLicense] = None
     final_render: Optional[AssetRef] = None
     scene_consistency: Optional[SceneConsistencyReport] = None
+    automation: AutomationState = Field(default_factory=AutomationState)
     production_job: Optional[ProductionJob] = None
     cost: CostLedger = Field(default_factory=CostLedger)
 
