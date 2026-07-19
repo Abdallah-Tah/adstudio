@@ -85,6 +85,28 @@ class ProductIdentityQC(BaseModel):
         )
 
 
+class SceneConsistencyVerdict(BaseModel):
+    scene_id: str
+    consistent: bool
+    drifted_features: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class SceneConsistencyReport(BaseModel):
+    """Cross-scene product identity check over the selected scene images.
+
+    Scenes are generated independently, so each can pass per-scene identity QC
+    against the uploads while still disagreeing with each other. This report is
+    the production gate for that failure mode. `fingerprint` binds the verdict
+    to the exact set of selected images it judged — reselecting any image makes
+    the report stale."""
+    checked_at: str
+    fingerprint: str
+    consistent: bool
+    verdicts: list[SceneConsistencyVerdict] = Field(default_factory=list)
+    cost_cents: int = 0
+
+
 class QCOverride(BaseModel):
     overridden_by: str
     overridden_at: str
@@ -159,6 +181,7 @@ class ProcessingWarning(BaseModel):
         "segmentation_failed",
         "segmentation_low_coverage",
         "segmentation_high_coverage",
+        "segmentation_fragmented",
         "unsupported_image",
         "reference_low_resolution",
         "reference_extreme_crop",
@@ -353,6 +376,7 @@ class Project(BaseModel):
     music: Optional[AssetRef] = None
     music_license: Optional[MusicLicense] = None
     final_render: Optional[AssetRef] = None
+    scene_consistency: Optional[SceneConsistencyReport] = None
     production_job: Optional[ProductionJob] = None
     cost: CostLedger = Field(default_factory=CostLedger)
 

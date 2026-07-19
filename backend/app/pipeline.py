@@ -65,6 +65,9 @@ def create_project(
             ))
         cutout, warning = segmentation.segment(raw)
         if cutout is not None:
+            if warning is not None:
+                # e.g. segmentation_fragmented: cutout usable but flagged
+                warnings.append(warning.model_copy(update={"asset_id": asset_id}))
             cut_id = f"ast_{uuid.uuid4().hex[:12]}"
             cut_uri = storage.put_bytes(
                 cutout, f"{project_id}/uploads/{cut_id}.png", "image/png")

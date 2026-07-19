@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from app import generation_config
 from app.compiler import engines
+from app.stages import scene_consistency
 from app.schema import (
     Generation,
     ProductionBlockingReason,
@@ -130,6 +131,25 @@ def validate(project: Project) -> ProductionReadiness:
             reasons.append(ProductionBlockingReason(
                 code="PROVIDER_NOT_CONFIGURED",
                 message=f"{key} is not configured.",
+            ))
+
+    if generation_config.SCENE_CONSISTENCY_QC_ENABLED:
+        if scene_consistency.is_current(project) and not project.scene_consistency.consistent:
+            for verdict in project.scene_consistency.verdicts:
+                if verdict.consistent:
+                    continue
+                drift = ", ".join(verdict.drifted_features) or verdict.notes or "product differs"
+                reasons.append(ProductionBlockingReason(
+                    code="PRODUCT_IDENTITY_INCONSISTENT",
+                    scene_id=verdict.scene_id,
+                    message=f"Product identity drifts across scenes: {drift}.",
+                ))
+        elif not scene_consistency.is_current(project) and not os.environ.get("OPENAI_API_KEY"):
+            # the produce endpoint must run the cross-scene check before
+            # spending on videos; without the key that check cannot run
+            reasons.append(ProductionBlockingReason(
+                code="PROVIDER_NOT_CONFIGURED",
+                message="OPENAI_API_KEY is not configured (cross-scene identity check).",
             ))
 
     if project.production_job and project.production_job.status in ACTIVE_PRODUCTION_STATUSES:

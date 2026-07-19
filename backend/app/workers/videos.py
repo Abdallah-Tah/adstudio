@@ -449,7 +449,9 @@ def _finalize_completed(
             break
         refs.append(storage.get_bytes(ref.uri))
     try:
-        verdict, qc_cost = qc.run_qc(clip, refs, scene)
+        verdict, qc_cost = qc.run_qc(
+            clip, refs, scene,
+            start_frame_included=bool(source and source.asset))
     except Exception as exc:
         gen.qc_latency_ms = int((time.monotonic() - t0) * 1000)
         gen.status = "failed"

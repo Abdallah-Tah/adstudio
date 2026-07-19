@@ -241,6 +241,13 @@ function sceneNumbersFromBlockers(readiness: ProductionReadiness | null, project
     .map((order) => order + 1);
 }
 function readinessMessage(readiness: ProductionReadiness | null, project: Project | null) {
+  const inconsistent = sceneNumbersFromBlockers(readiness, project, ["PRODUCT_IDENTITY_INCONSISTENT"]);
+  if (inconsistent.length > 0) {
+    const scenes = inconsistent.length === 1
+      ? `Scene ${inconsistent[0]}`
+      : `Scenes ${inconsistent.slice(0, -1).join(", ")} and ${inconsistent[inconsistent.length - 1]}`;
+    return `Cannot produce ad yet. ${scenes} shows a different-looking product than the other scenes (cross-scene identity check). Regenerate or reselect the image${inconsistent.length === 1 ? "" : "s"} so every scene shows the exact uploaded product.`;
+  }
   const nums = sceneNumbersFromBlockers(readiness, project, ["SCENE_QC_FAILED"]);
   const exhausted = sceneNumbersFromBlockers(readiness, project, ["SCENE_VIDEO_ATTEMPTS_EXHAUSTED"]);
   if (nums.length > 0) {

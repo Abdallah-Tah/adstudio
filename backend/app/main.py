@@ -11,7 +11,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import auth, db, production_readiness, settings_store
+from app import auth, db, generation_config, production_readiness, settings_store
 from app.compiler.gpt_image import compile_image_prompt
 
 # Load provider keys from .env into the environment before anything reads them.
@@ -19,6 +19,7 @@ settings_store.load_env()
 from app.pipeline import create_project
 from app.schema import Project, QCOverride, StoryboardApproval
 from app.snapshots import snapshot_project
+from app.stages import scene_consistency
 from app.stages.brief import UserInputs
 from app.stages.storyboard import StoryboardValidationError
 from app.storage import Storage
@@ -717,6 +718,37 @@ def select_video(project_id: str, scene_id: str, body: SelectImage,
     return enriched(project)
 
 
+def _run_scene_consistency(session: Session, storage: Storage,
+                           project_id: str) -> Project:
+    """Run the cross-scene identity check, store the report, meter the spend."""
+    row, project = _load_project(session, project_id)
+    try:
+        report, cost = scene_consistency.run_check(project, storage)
+    except ValueError as exc:
+        raise HTTPException(422, {
+            "error_code": "IDENTITY_CONSISTENCY_INPUT_MISSING",
+            "message": str(exc),
+        })
+    project.scene_consistency = report
+    project.cost.qc += cost
+    row.data = project.model_dump(mode="json")
+    snapshot_project(session, project, actor="user",
+                     reason=f"identity-consistency check "
+                            f"({'consistent' if report.consistent else 'inconsistent'})")
+    session.commit()
+    log.info("scene consistency project=%s consistent=%s cost_cents=%d",
+             project_id, report.consistent, cost)
+    return project
+
+
+@app.post("/projects/{project_id}/identity-consistency")
+def identity_consistency(project_id: str, session: SessionDep,
+                         storage: StorageDep) -> dict:
+    """Re-judge all selected scene images against the primary product reference."""
+    project = _run_scene_consistency(session, storage, project_id)
+    return project.scene_consistency.model_dump(mode="json")
+
+
 @app.get("/api/projects/{project_id}/production-readiness")
 @app.get("/projects/{project_id}/production-readiness")
 def production_readiness_endpoint(project_id: str, session: SessionDep) -> dict:
@@ -733,12 +765,21 @@ def production_readiness_endpoint(project_id: str, session: SessionDep) -> dict:
 
 
 @app.post("/projects/{project_id}/produce")
-def produce(project_id: str, session: SessionDep) -> dict:
+def produce(project_id: str, session: SessionDep, storage: StorageDep) -> dict:
     """Run stages 6→9. Backend readiness is the source of truth."""
     row, project = _load_project(session, project_id)
     active_job = production_readiness.active_job(project)
     if active_job:
         return {"status": "producing", "production_job": active_job.model_dump(mode="json")}
+    if (
+        generation_config.SCENE_CONSISTENCY_QC_ENABLED
+        and not scene_consistency.is_current(project)
+        and all(s.selected_image for s in project.scenes)
+        and os.environ.get("OPENAI_API_KEY")
+    ):
+        # cross-scene identity gate: judged BEFORE any video spend
+        project = _run_scene_consistency(session, storage, project_id)
+        row, project = _load_project(session, project_id)
     readiness = production_readiness.validate(project)
     if not readiness.ready:
         log.info("production blocked project=%s blockers=%s",

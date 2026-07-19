@@ -38,6 +38,8 @@ IMAGE_IDENTITY_QC_THRESHOLD = _float_env("IMAGE_IDENTITY_QC_THRESHOLD", 0.82)
 AUTO_RETRY_IMAGES = os.environ.get("AUTO_RETRY_IMAGES", "true").lower() in (
     "1", "true", "yes",
 )
+SCENE_CONSISTENCY_QC_ENABLED = os.environ.get(
+    "SCENE_CONSISTENCY_QC_ENABLED", "true").lower() in ("1", "true", "yes")
 AUTO_RETRY_VIDEO_INFRASTRUCTURE_FAILURES = os.environ.get(
     "AUTO_RETRY_VIDEO_INFRASTRUCTURE_FAILURES", "true").lower() in ("1", "true", "yes")
 AUTO_RETRY_VIDEO_QUALITY_FAILURES = os.environ.get(

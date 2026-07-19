@@ -27,12 +27,13 @@ MAX_REFERENCES = 2
 class QCVerdict(BaseModel):
     identity_ok: bool             # product identical to the references
     artifacts: bool               # warping / morphing / extra parts / glitches
+    frame_drift: bool = False     # product changes between keyframes over time
     caption_legible: Optional[bool] = None  # null until captions are burned in
     notes: str
 
     @property
     def passed(self) -> bool:
-        return self.identity_ok and not self.artifacts
+        return self.identity_ok and not self.artifacts and not self.frame_drift
 
 
 def qc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
@@ -92,18 +93,29 @@ def run_qc(
     reference_pngs: list[bytes],
     scene: Scene,
     captions_burned: bool = False,
+    start_frame_included: bool = False,
 ) -> tuple[QCVerdict, int]:
-    """Returns (verdict, cost_cents). One vision call per clip."""
+    """Returns (verdict, cost_cents). One vision call per clip.
+
+    When `start_frame_included` is true, reference_pngs[0] is the QC-approved
+    still the clip was generated from — the identity anchor the video must not
+    drift away from."""
     keyframes = extract_keyframes(clip_bytes)
     refs = reference_pngs[:MAX_REFERENCES]
 
+    anchor_note = (
+        "The FIRST reference is the approved still this clip was generated "
+        "from; the product in every keyframe must stay identical to it.\n"
+        if start_frame_included and refs else ""
+    )
     content: list[dict] = [{
         "type": "text",
         "text": (
             f"You are the quality gate for a product video ad.\n"
             f"The first {len(refs)} image(s) are REFERENCE photos of the real "
-            f"product. The remaining {len(keyframes)} images are keyframes from "
-            "a generated clip that is supposed to show:\n"
+            f"product. {anchor_note}"
+            f"The remaining {len(keyframes)} images are keyframes IN TIME ORDER "
+            "from a generated clip that is supposed to show:\n"
             f"- Action: {scene.action}\n"
             f"- Camera: {scene.camera}\n"
             f"- Lighting: {scene.lighting}\n\n"
@@ -113,6 +125,11 @@ def run_qc(
             "substitution, restyling, or invented parts means false.\n"
             "- artifacts: true if there is warping, morphing, flicker, extra "
             "limbs/parts, garbled text, or obvious generation glitches.\n"
+            "- frame_drift: true if the product CHANGES ACROSS the keyframes "
+            "over time — parts appearing or disappearing, attachment geometry, "
+            "product length, chamber size, controls, logo, or proportions "
+            "shifting between frames, even if each frame looks plausible "
+            "alone.\n"
             + ("- caption_legible: are the burned-in captions readable?\n"
                if captions_burned else
                "- caption_legible: null (no captions in this clip).\n")
